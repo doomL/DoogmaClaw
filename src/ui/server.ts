@@ -7,11 +7,38 @@ import { createQuickJob, deleteJob } from "./services/jobs";
 import { readLogs } from "./services/logs";
 
 export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
+  const auth = opts.auth;
+  const authMiddleware = (req: Request): Response | null => {
+    if (!auth) return null;
+    if (req.url.includes("/api/health")) return null;
+    const header = req.headers.get("Authorization") ?? "";
+    if (!header.startsWith("Basic ")) {
+      return new Response("Unauthorized", {
+        status: 401,
+        headers: { "WWW-Authenticate": 'Basic realm="ClaudeClaw"' },
+      });
+    }
+    const decoded = Buffer.from(header.slice(6), "base64").toString("utf-8");
+    const sep = decoded.indexOf(":");
+    const user = sep >= 0 ? decoded.slice(0, sep) : decoded;
+    const pass = sep >= 0 ? decoded.slice(sep + 1) : "";
+    if (user !== auth.username || pass !== auth.password) {
+      return new Response("Unauthorized", {
+        status: 401,
+        headers: { "WWW-Authenticate": 'Basic realm="ClaudeClaw"' },
+      });
+    }
+    return null;
+  };
+
   const server = Bun.serve({
     hostname: opts.host,
     port: opts.port,
     idleTimeout: 0,
     fetch: async (req) => {
+      const denied = authMiddleware(req);
+      if (denied) return denied;
+
       const url = new URL(req.url);
 
       if (url.pathname === "/" || url.pathname === "/index.html") {

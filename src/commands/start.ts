@@ -411,6 +411,7 @@ export async function start(args: string[] = []) {
         return startWebUi({
           host,
           port: candidatePort,
+          auth: currentSettings.web.auth,
           getSnapshot: () => ({
             pid: process.pid,
             startedAt: daemonStartedAt,

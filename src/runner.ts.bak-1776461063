@@ -8,12 +8,11 @@ import {
   incrementThreadTurn,
   markThreadCompactWarned,
 } from "./sessionManager";
-import { getSettings, isForceFallbackMode, type ModelConfig, type SecurityConfig } from "./config";
+import { getSettings, type ModelConfig, type SecurityConfig } from "./config";
 import { buildClockPromptPrefix } from "./timezone";
 import { selectModel } from "./model-router";
 import {
   extractLastVisibleAssistantTextFromSessionJsonl,
-  isPlaceholderAssistantOutput,
   repairSessionJsonlForCompatGateways,
 } from "./sessionTranscript";
 
@@ -62,12 +61,6 @@ export interface RunResult {
   exitCode: number;
   /** Human-readable: which slot and model answered (Telegram/Discord prefix). */
   modelTag?: string;
-  /**
-   * True when this reply used a brand-new Claude session because `--resume` failed
-   * (rate limits, gateway transcript errors, timeout recovery, etc.). Not set for the
-   * very first message ever (`isNew` only).
-   */
-  freshSessionStart?: boolean;
 }
 
 const ZAI_ANTHROPIC_BASE = "https://api.z.ai/api/anthropic";
@@ -176,42 +169,6 @@ function extractRateLimitMessage(stdout: string, stderr: string): string | null 
 let globalQueue: Promise<unknown> = Promise.resolve();
 // Per-thread queues — each thread runs independently in parallel
 const threadQueues = new Map<string, Promise<unknown>>();
-type ActiveClaudeProcess = {
-  pid: number;
-  name: string;
-  startedAt: number;
-  proc: ReturnType<typeof Bun.spawn>;
-};
-const activeClaudeProcesses = new Map<number, ActiveClaudeProcess>();
-
-function trackActiveClaudeProcess(proc: ReturnType<typeof Bun.spawn>, name: string): void {
-  const pid = proc.pid;
-  if (!pid || pid <= 0) return;
-  activeClaudeProcesses.set(pid, { pid, name, startedAt: Date.now(), proc });
-}
-
-function untrackActiveClaudeProcess(proc: ReturnType<typeof Bun.spawn>): void {
-  const pid = proc.pid;
-  if (!pid || pid <= 0) return;
-  activeClaudeProcesses.delete(pid);
-}
-
-export function interruptActiveRuns(reason: string = "manual interrupt"): {
-  interrupted: number;
-  details: string[];
-} {
-  const details: string[] = [];
-  for (const entry of activeClaudeProcesses.values()) {
-    const ageSec = Math.max(1, Math.floor((Date.now() - entry.startedAt) / 1000));
-    details.push(`${entry.name} pid=${entry.pid} age=${ageSec}s`);
-    try { entry.proc.kill("SIGTERM"); } catch {}
-    setTimeout(() => { try { entry.proc.kill("SIGKILL"); } catch {} }, 5000);
-  }
-  if (details.length > 0) {
-    console.warn(`[${new Date().toLocaleTimeString()}] Interrupted ${details.length} active Claude run(s): ${reason}`);
-  }
-  return { interrupted: details.length, details };
-}
 
 function enqueue<T>(fn: () => Promise<T>, threadId?: string): Promise<T> {
   if (threadId) {
@@ -240,9 +197,7 @@ function isOpenAiCompatTranscriptError(stdout: string, stderr: string): boolean 
   const t = `${stdout}\n${stderr}`;
   return (
     /Tool message at position|must follow an assistant message with tool_calls/i.test(t) ||
-    /"messages" in request are illegal|messages.*illegal|\b20015\b/i.test(t) ||
-    /tool.use concurrency/i.test(t) ||
-    /Invalid messages at \d+/i.test(t)
+    /"messages" in request are illegal|messages.*illegal|\b20015\b/i.test(t)
   );
 }
 
@@ -329,7 +284,6 @@ async function runClaudeOnce(
     stderr: "pipe",
     env: buildChildEnv(baseEnv, model, api),
   });
-  trackActiveClaudeProcess(proc, "runClaudeOnce");
 
   const timeoutPromise = new Promise<never>((_, reject) => {
     setTimeout(() => reject(new Error(`Claude session timed out after ${timeoutMs / 1000}s`)), timeoutMs);
@@ -344,7 +298,6 @@ async function runClaudeOnce(
       timeoutPromise,
     ]) as [string, string];
     await proc.exited;
-    untrackActiveClaudeProcess(proc);
 
     return {
       rawStdout,
@@ -355,7 +308,6 @@ async function runClaudeOnce(
     // Kill the hung process
     try { proc.kill("SIGTERM"); } catch {}
     setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} }, 5000);
-    untrackActiveClaudeProcess(proc);
 
     const message = err instanceof Error ? err.message : String(err);
     console.error(`[${new Date().toLocaleTimeString()}] ${message}`);
@@ -575,10 +527,6 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
     model: fallback?.model ?? "",
     api: fallback?.api ?? "",
   };
-  // Force-fallback mode: use fallback model as primary (for testing)
-  if (isForceFallbackMode() && (fallbackConfig.model.trim() || fallbackConfig.api.trim())) {
-    primaryConfig = { ...fallbackConfig };
-  }
   const securityArgs = buildSecurityArgs(security);
   const timeoutMs = settings.sessionTimeoutMs;
 
@@ -695,15 +643,6 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
         usedFreshSessionStart = true;
       }
     }
-    // No distinct fallback configured (or same model): start a fresh primary session
-    if (exec.exitCode !== 0 && (!hasModelConfig(fallbackConfig) || sameModelConfig(primaryConfig, fallbackConfig))) {
-      console.warn(
-        `[${new Date().toLocaleTimeString()}] No separate fallback; starting fresh primary session after transcript error.`
-      );
-      args = buildClaudeInvokeArgs(prompt, securityArgs, appendSystemPrompt, null);
-      exec = await runClaudeOnce(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs);
-      usedFreshSessionStart = true;
-    }
   }
 
   // Rate limit can appear only after a later primary attempt (e.g. fresh session following
@@ -794,14 +733,6 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
     }
   }
 
-  if (!rateLimitMessage && exitCode === 0 && isPlaceholderAssistantOutput(stdout)) {
-    stdout =
-      "Il modello non ha restituito testo utile (solo un segnaposto dal provider). Ripeti la domanda o prova /useprimary se sei sul fallback.";
-    console.warn(
-      `[${new Date().toLocaleTimeString()}] Replaced placeholder assistant output for session ${sessionId.slice(0, 8)}…`,
-    );
-  }
-
   const effectiveCfg: ModelConfig = usedFallback ? fallbackConfig : primaryConfig;
   const modelTag = buildModelTag(usedFallback, effectiveCfg, agentic.enabled, taskType);
 
@@ -810,7 +741,6 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
     stderr,
     exitCode,
     modelTag,
-    freshSessionStart: usedFreshSessionStart,
   };
 
   const output = [
@@ -862,25 +792,10 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
       if (retryExec.exitCode === 0) {
         const count = threadId ? await incrementThreadTurn(threadId) : await incrementTurn();
         console.log(`[${new Date().toLocaleTimeString()}] Turn count: ${count} (after compact + retry)`);
-        return retryResult;
       }
-      // Retry still failed — fall through to try fallback below
-      exec = { rawStdout: retryExec.rawStdout, stderr: retryExec.stderr, exitCode: retryExec.exitCode };
-    }
-    // Compact failed or compact+retry failed — try fresh fallback session
-    if (!usedFallback && hasModelConfig(fallbackConfig) && !sameModelConfig(primaryConfig, fallbackConfig)) {
-      console.warn(
-        `[${new Date().toLocaleTimeString()}] Timeout recovery: trying fallback with fresh session...`
-      );
-      usedFallback = true;
-      const fbArgs = buildClaudeInvokeArgs(prompt, securityArgs, appendSystemPrompt, null);
-      exec = await runClaudeOnce(fbArgs, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs);
-      usedFreshSessionStart = true;
+      return retryResult;
     }
   }
-
-  // Timeout recovery may set usedFreshSessionStart after result was built.
-  result.freshSessionStart = usedFreshSessionStart;
 
   // --- Turn tracking & compact warning ---
   if (exitCode === 0 && !isNew) {
@@ -952,7 +867,6 @@ async function streamClaude(
     stderr: "pipe",
     env: childEnv,
   });
-  trackActiveClaudeProcess(proc, "streamClaude");
 
   const reader = proc.stdout.getReader();
   const decoder = new TextDecoder();
@@ -1021,7 +935,6 @@ async function streamClaude(
   }
 
   await proc.exited;
-  untrackActiveClaudeProcess(proc);
   // Ensure unblock fires even if something unexpected happened
   maybeUnblock();
 

@@ -15,6 +15,7 @@ const DEFAULT_SETTINGS: Settings = {
     model: "",
     api: "",
   },
+  sessionTimeoutMs: 15 * 60 * 1000,
   agentic: {
     enabled: false,
     defaultMode: "implementation",
@@ -61,6 +62,11 @@ const DEFAULT_SETTINGS: Settings = {
   security: { level: "moderate", allowedTools: [], disallowedTools: [] },
   web: { enabled: false, host: "127.0.0.1", port: 4632 },
   stt: { baseUrl: "", model: "" },
+  imageGen: {
+    enabled: false,
+    model: "google/gemini-2.5-flash-image",
+    api: "",
+  },
 };
 
 export interface HeartbeatExcludeWindow {
@@ -105,6 +111,8 @@ export interface Settings {
   api: string;
   fallback: ModelConfig;
   agentic: AgenticConfig;
+  /** Max wall time for one `claude -p` invocation (ms). Default 15m; cap 2h. */
+  sessionTimeoutMs: number;
   timezone: string;
   timezoneOffsetMinutes: number;
   heartbeat: HeartbeatConfig;
@@ -113,6 +121,7 @@ export interface Settings {
   security: SecurityConfig;
   web: WebConfig;
   stt: SttConfig;
+  imageGen: ImageGenConfig;
 }
 
 export interface AgenticMode {
@@ -133,10 +142,16 @@ export interface ModelConfig {
   api: string;
 }
 
+export interface WebAuthConfig {
+  username: string;
+  password: string;
+}
+
 export interface WebConfig {
   enabled: boolean;
   host: string;
   port: number;
+  auth?: WebAuthConfig;
 }
 
 export interface SttConfig {
@@ -146,6 +161,15 @@ export interface SttConfig {
   baseUrl: string;
   /** Model name passed to the API (default: "Systran/faster-whisper-large-v3") */
   model: string;
+}
+
+/** OpenRouter chat/completions image generation (see prompts/IMAGE_TELEGRAM.md). */
+export interface ImageGenConfig {
+  enabled: boolean;
+  /** OpenRouter model id, e.g. google/gemini-2.5-flash-image */
+  model: string;
+  /** Bearer key; if empty, uses fallback.api then primary api */
+  api: string;
 }
 
 let cached: Settings | null = null;
@@ -166,6 +190,15 @@ const VALID_LEVELS = new Set<SecurityLevel>([
   "moderate",
   "unrestricted",
 ]);
+
+function parseSessionTimeoutMs(raw: unknown): number {
+  const fallback = 15 * 60 * 1000;
+  if (raw === undefined || raw === null) return fallback;
+  const n = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isFinite(n)) return fallback;
+  const ms = Math.floor(n);
+  return Math.min(Math.max(ms, 60_000), 2 * 60 * 60 * 1000);
+}
 
 function parseAgenticMode(raw: any): AgenticMode | null {
   if (!raw || typeof raw !== "object") return null;
@@ -217,7 +250,7 @@ function parseAgenticConfig(raw: any): AgenticConfig {
   };
 }
 
-function parseSettings(raw: Record<string, any>): Settings {
+function parseSettings(raw: Record<string, any>, discordUserIdsOverride?: string[]): Settings {
   const rawLevel = raw.security?.level;
   const level: SecurityLevel =
     typeof rawLevel === "string" && VALID_LEVELS.has(rawLevel as SecurityLevel)
@@ -233,6 +266,7 @@ function parseSettings(raw: Record<string, any>): Settings {
       model: typeof raw.fallback?.model === "string" ? raw.fallback.model.trim() : "",
       api: typeof raw.fallback?.api === "string" ? raw.fallback.api.trim() : "",
     },
+    sessionTimeoutMs: parseSessionTimeoutMs(raw.sessionTimeoutMs),
     agentic: parseAgenticConfig(raw.agentic),
     timezone: parsedTimezone,
     timezoneOffsetMinutes: parseTimezoneOffsetMinutes(raw.timezoneOffsetMinutes, parsedTimezone),
@@ -249,9 +283,12 @@ function parseSettings(raw: Record<string, any>): Settings {
     },
     discord: {
       token: typeof raw.discord?.token === "string" ? raw.discord.token.trim() : "",
-      allowedUserIds: Array.isArray(raw.discord?.allowedUserIds)
-          ? raw.discord.allowedUserIds.map(String)
-          : [],
+      allowedUserIds:
+        discordUserIdsOverride && discordUserIdsOverride.length > 0
+          ? discordUserIdsOverride
+          : Array.isArray(raw.discord?.allowedUserIds)
+            ? raw.discord.allowedUserIds.map(String)
+            : [],
       listenChannels: Array.isArray(raw.discord?.listenChannels)
         ? raw.discord.listenChannels.map(String)
         : [],
@@ -269,12 +306,32 @@ function parseSettings(raw: Record<string, any>): Settings {
       enabled: raw.web?.enabled ?? false,
       host: raw.web?.host ?? "127.0.0.1",
       port: Number.isFinite(raw.web?.port) ? Number(raw.web.port) : 4632,
+      ...(raw.web?.auth?.username && raw.web?.auth?.password
+        ? { auth: { username: String(raw.web.auth.username), password: String(raw.web.auth.password) } }
+        : {}),
     },
     stt: {
       baseUrl: typeof raw.stt?.baseUrl === "string" ? raw.stt.baseUrl.trim() : "",
       model: typeof raw.stt?.model === "string" ? raw.stt.model.trim() : "",
     },
+    imageGen: {
+      enabled: Boolean(raw.imageGen?.enabled),
+      model:
+        typeof raw.imageGen?.model === "string" && raw.imageGen.model.trim()
+          ? raw.imageGen.model.trim()
+          : "google/gemini-2.5-flash-image",
+      api: typeof raw.imageGen?.api === "string" ? raw.imageGen.api.trim() : "",
+    },
   };
+}
+
+/** API key for OpenRouter image calls: explicit imageGen.api, else fallback, else primary. */
+export function resolveImageGenApiKey(settings: Settings): string {
+  const a = settings.imageGen.api.trim();
+  if (a) return a;
+  const f = settings.fallback.api.trim();
+  if (f) return f;
+  return settings.api.trim();
 }
 
 const TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
@@ -347,6 +404,22 @@ export async function reloadSettings(): Promise<Settings> {
   return cached;
 }
 
+
+/** Persist a new fallback model to settings.json and reload the cache. */
+export async function updateFallbackModel(model: string): Promise<void> {
+  const rawText = await Bun.file(SETTINGS_FILE).text();
+  const raw = JSON.parse(rawText);
+  if (!raw.fallback) raw.fallback = {};
+  raw.fallback.model = model.trim();
+  await Bun.write(SETTINGS_FILE, JSON.stringify(raw, null, 2) + "\n");
+  const discordIds = extractDiscordUserIds(rawText);
+  cached = parseSettings(raw, discordIds);
+}
+
+// --- Force-fallback mode (in-memory only, not persisted) ---
+let _forceFallbackMode = false;
+export function isForceFallbackMode(): boolean { return _forceFallbackMode; }
+export function setForceFallbackMode(v: boolean): void { _forceFallbackMode = v; }
 export function getSettings(): Settings {
   if (!cached) throw new Error("Settings not loaded. Call loadSettings() first.");
   return cached;

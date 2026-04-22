@@ -1,4 +1,10 @@
-import { ensureProjectClaudeMd, run, runUserMessage, compactCurrentSession } from "../runner";
+import {
+  ensureProjectClaudeMd,
+  humanReadableFromClaudeCliOutput,
+  run,
+  runUserMessage,
+  compactCurrentSession,
+} from "../runner";
 import { getSettings, loadSettings } from "../config";
 import { resetSession, peekSession } from "../sessions";
 import { listThreadSessions, removeThreadSession, peekThreadSession } from "../sessionManager";
@@ -614,7 +620,7 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
     const promptParts = [`[Discord from ${label}]`];
     if (skillContext) {
       const args = cleanContent.trim().slice(command!.length).trim();
-      promptParts.push(`<command-name>${command}</command-name>`);
+      promptParts.push(`Slash command invoked: ${command}`);
       promptParts.push(skillContext);
       if (args) promptParts.push(`User arguments: ${args}`);
     } else if (cleanContent.trim()) {
@@ -641,15 +647,24 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
     const result = await runUserMessage("discord", prefixedPrompt, threadId);
 
     if (result.exitCode !== 0) {
-      await sendMessage(config.token, channelId, `Error (exit ${result.exitCode}): ${result.stderr || result.stdout || "Unknown error"}`);
+      const detail = humanReadableFromClaudeCliOutput(result.stdout || "", result.stderr || "");
+      await sendMessage(config.token, channelId, `Error (exit ${result.exitCode}): ${detail}`);
     } else {
+      if (result.freshSessionStart) {
+        await sendMessage(
+          config.token,
+          channelId,
+          "⚠️ **Nuova sessione**: non sono riuscito a riprendere la conversazione precedente; questa risposta parte da contesto **vuoto** (come dopo `/reset`).",
+        );
+      }
       const { cleanedText, reactionEmoji } = extractReactionDirective(result.stdout || "");
       if (reactionEmoji) {
         await sendReaction(config.token, channelId, message.id, reactionEmoji).catch((err) => {
           console.error(`[Discord] Failed to send reaction for ${label}: ${err instanceof Error ? err.message : err}`);
         });
       }
-      await sendMessage(config.token, channelId, cleanedText || "(empty response)");
+      const modelHdr = result.modelTag ? `**Model** · ${result.modelTag}\n\n` : "";
+      await sendMessage(config.token, channelId, modelHdr + (cleanedText || "(empty response)"));
     }
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);

@@ -1,5 +1,13 @@
-import { ensureProjectClaudeMd, run, runUserMessage, compactCurrentSession } from "../runner";
-import { getSettings, loadSettings } from "../config";
+import {
+  ensureProjectClaudeMd,
+  humanReadableFromClaudeCliOutput,
+  run,
+  runUserMessage,
+  compactCurrentSession,
+  interruptActiveRuns,
+} from "../runner";
+import { getSettings, loadSettings, resolveImageGenApiKey, isForceFallbackMode, setForceFallbackMode, updateFallbackModel } from "../config";
+import { generateImageOpenRouter } from "../openrouterImage";
 import { resetSession, peekSession } from "../sessions";
 import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
@@ -286,6 +294,52 @@ function extractTelegramCommand(text: string): string | null {
   return firstToken.split("@", 1)[0].toLowerCase();
 }
 
+/** Plain-text chunk size before HTML conversion (room for tags under Telegram 4096 limit). */
+const TELEGRAM_PLAIN_CHUNK = 3500;
+
+function chunkMarkdownForTelegram(text: string, maxPlain: number): string[] {
+  const t = text.replace(/\r\n/g, "\n");
+  if (!t) return [""];
+  const out: string[] = [];
+  let buf = "";
+  const flushOversized = () => {
+    if (!buf) return;
+    if (buf.length <= maxPlain) {
+      out.push(buf);
+      buf = "";
+      return;
+    }
+    for (let i = 0; i < buf.length; i += maxPlain) {
+      out.push(buf.slice(i, i + maxPlain));
+    }
+    buf = "";
+  };
+
+  for (const para of t.split("\n\n")) {
+    const candidate = buf ? `${buf}\n\n${para}` : para;
+    if (candidate.length <= maxPlain) {
+      buf = candidate;
+    } else {
+      flushOversized();
+      if (para.length <= maxPlain) buf = para;
+      else {
+        for (let i = 0; i < para.length; i += maxPlain) {
+          out.push(para.slice(i, i + maxPlain));
+        }
+      }
+    }
+  }
+  flushOversized();
+  if (buf) out.push(buf);
+  return out.length ? out : [""];
+}
+
+function formatModelHeaderMarkdown(modelTag: string | undefined): string {
+  if (!modelTag) return "";
+  const safe = modelTag.replace(/\*/g, "·").replace(/`/g, "′");
+  return `**Model** · ${safe}\n\n`;
+}
+
 async function callApi<T>(token: string, method: string, body?: Record<string, unknown>): Promise<T> {
   const res = await fetch(`${API_BASE}${token}/${method}`, {
     method: "POST",
@@ -300,21 +354,20 @@ async function callApi<T>(token: string, method: string, body?: Record<string, u
 
 async function sendMessage(token: string, chatId: number, text: string, threadId?: number): Promise<void> {
   const normalized = normalizeTelegramText(text).replace(/\[react:[^\]\r\n]+\]/gi, "");
-  const html = markdownToTelegramHtml(normalized);
-  const MAX_LEN = 4096;
-  for (let i = 0; i < html.length; i += MAX_LEN) {
+  const pieces = chunkMarkdownForTelegram(normalized, TELEGRAM_PLAIN_CHUNK);
+  for (const piece of pieces) {
+    const html = markdownToTelegramHtml(piece);
     try {
       await callApi(token, "sendMessage", {
         chat_id: chatId,
-        text: html.slice(i, i + MAX_LEN),
+        text: html.length > 4096 ? html.slice(0, 4090) + "…" : html,
         parse_mode: "HTML",
         ...(threadId ? { message_thread_id: threadId } : {}),
       });
     } catch {
-      // Fallback to plain text if HTML parsing fails
       await callApi(token, "sendMessage", {
         chat_id: chatId,
-        text: normalized.slice(i, i + MAX_LEN),
+        text: piece.length > 4096 ? piece.slice(0, 4090) + "…" : piece,
         ...(threadId ? { message_thread_id: threadId } : {}),
       });
     }
@@ -386,6 +439,57 @@ function extractSendFileDirectives(text: string): {
     .replace(/\n{3,}/g, "\n\n")
     .trim();
   return { cleanedText, filePaths };
+}
+
+const MAX_GENERATE_IMAGES_PER_MESSAGE = 3;
+
+function extractGenerateImageDirectives(text: string): { cleanedText: string; imagePrompts: string[] } {
+  const imagePrompts: string[] = [];
+  const cleanedText = text
+    .replace(/\[generate-image:([^\]\r\n]+)\]/gi, (_match, raw) => {
+      const candidate = String(raw).trim();
+      if (candidate) imagePrompts.push(candidate);
+      return "";
+    })
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  return { cleanedText, imagePrompts };
+}
+
+function extFromImageMime(mime: string): string {
+  const m = mime.toLowerCase();
+  if (m.includes("jpeg") || m.includes("jpg")) return ".jpg";
+  if (m.includes("webp")) return ".webp";
+  return ".png";
+}
+
+async function sendPhotoBytes(
+  token: string,
+  chatId: number,
+  bytes: Uint8Array,
+  filename: string,
+  mime: string,
+  caption: string | undefined,
+  threadId?: number,
+): Promise<void> {
+  const blob = new Blob([bytes], { type: mime });
+  const formData = new FormData();
+  formData.append("chat_id", String(chatId));
+  formData.append("photo", blob, filename);
+  if (caption?.trim()) {
+    formData.append("caption", caption.trim().slice(0, 1024));
+  }
+  if (threadId) formData.append("message_thread_id", String(threadId));
+
+  const res = await fetch(`${API_BASE}${token}/sendPhoto`, {
+    method: "POST",
+    body: formData,
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Telegram sendPhoto failed: ${res.status} ${body}`);
+  }
 }
 
 async function sendReaction(token: string, chatId: number, messageId: number, emoji: string): Promise<void> {
@@ -624,6 +728,22 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     return;
   }
 
+  if (command === "/interrupt") {
+    const result = interruptActiveRuns("telegram /interrupt");
+    if (result.interrupted === 0) {
+      await sendMessage(config.token, chatId, "No active Claude run to interrupt.", threadId);
+      return;
+    }
+    const details = result.details.slice(0, 3).join("\n");
+    await sendMessage(
+      config.token,
+      chatId,
+      `Interrupted ${result.interrupted} active run(s).\n${details}\n\nYou can now send a new message.`,
+      threadId
+    );
+    return;
+  }
+
   if (command === "/compact") {
     await sendMessage(config.token, chatId, "⏳ Compacting session...", threadId);
     const result = await compactCurrentSession();
@@ -642,7 +762,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
       "📊 **Session Status**",
       `Session: \`${session.sessionId.slice(0, 8)}\``,
       `Turns: ${session.turnCount ?? 0}`,
-      `Model: ${settings.model || "default"}`,
+      `Model: ${isForceFallbackMode() ? `${settings.fallback?.model || "fallback"} (forced)` : (settings.model || "default")}`,
       `Security: ${settings.security.level}`,
       `Created: ${session.createdAt}`,
       `Last used: ${session.lastUsedAt}`,
@@ -773,7 +893,39 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
 
     // Skill routing: resolve slash commands to SKILL.md prompts
     let skillContext: string | null = null;
-    if (command && command !== "/start" && command !== "/reset" && command !== "/compact" && command !== "/status" && command !== "/context") {
+  if (command === "/usefallback") {
+    const s = getSettings();
+    if (!s.fallback?.model?.trim()) {
+      await sendMessage(config.token, chatId, "No fallback model configured.", threadId);
+      return;
+    }
+    setForceFallbackMode(true);
+    await sendMessage(config.token, chatId, `Switched to fallback model: \`${s.fallback.model}\`\nUse /useprimary to switch back.`, threadId);
+    return;
+  }
+
+  if (command === "/useprimary") {
+    setForceFallbackMode(false);
+    const s = getSettings();
+    await sendMessage(config.token, chatId, `Switched back to primary model: \`${s.model || "default"}\``, threadId);
+    return;
+  }
+
+  if (command === "/setfallback") {
+    const modelId = text.trim().slice("/setfallback".length).trim();
+    if (!modelId) {
+      const s = getSettings();
+      await sendMessage(config.token, chatId, `Current fallback model: \`${s.fallback?.model || "none"}\`
+
+Usage: /setfallback openrouter/model-id`, threadId);
+      return;
+    }
+    await updateFallbackModel(modelId);
+    await sendMessage(config.token, chatId, `Fallback model updated: \`${modelId}\``, threadId);
+    return;
+  }
+
+    if (command && command !== "/start" && command !== "/reset" && command !== "/interrupt" && command !== "/compact" && command !== "/status" && command !== "/context" && command !== "/setfallback") {
       try {
         skillContext = await resolveSkillPrompt(command);
         if (skillContext) {
@@ -800,7 +952,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     if (skillContext) {
       // Strip the slash command from the message text and pass remaining args
       const args = text.trim().slice(command!.length).trim();
-      promptParts.push(`<command-name>${command}</command-name>`);
+      promptParts.push(`Slash command invoked: ${command}`);
       promptParts.push(skillContext);
       if (args) promptParts.push(`User arguments: ${args}`);
     } else if (text.trim()) {
@@ -835,17 +987,38 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     const result = await runUserMessage("telegram", prefixedPrompt);
 
     if (result.exitCode !== 0) {
-      await sendMessage(config.token, chatId, `Error (exit ${result.exitCode}): ${result.stderr || "Unknown error"}`, threadId);
+      if (result.exitCode === 143) {
+        // SIGTERM from /interrupt: expected cancellation, don't show a scary error.
+        await sendMessage(config.token, chatId, "Interrupted.", threadId);
+        return;
+      }
+      const detail = humanReadableFromClaudeCliOutput(result.stdout || "", result.stderr || "");
+      const clipped = detail.length > 3500 ? `${detail.slice(0, 3500)}…` : detail;
+      await sendMessage(config.token, chatId, `Error (exit ${result.exitCode}): ${clipped}`, threadId);
     } else {
+      if (result.freshSessionStart) {
+        await sendMessage(
+          config.token,
+          chatId,
+          "⚠️ **Nuova sessione**: non sono riuscito a riprendere la conversazione precedente; questa risposta parte da contesto **vuoto** (come dopo `/reset`).",
+          threadId,
+        );
+      }
       const { cleanedText: afterReact, reactionEmoji } = extractReactionDirective(result.stdout || "");
-      const { cleanedText, filePaths } = extractSendFileDirectives(afterReact);
-      if (reactionEmoji) {
+      const { cleanedText: afterFiles, filePaths } = extractSendFileDirectives(afterReact);
+      const { cleanedText, imagePrompts } = extractGenerateImageDirectives(afterFiles);
+      if (reactionEmoji && !isPrivate) {
         await sendReaction(config.token, chatId, message.message_id, reactionEmoji).catch((err) => {
           console.error(`[Telegram] Failed to send reaction for ${label}: ${err instanceof Error ? err.message : err}`);
         });
       }
       if (cleanedText) {
-        await sendMessage(config.token, chatId, cleanedText, threadId);
+        await sendMessage(
+          config.token,
+          chatId,
+          formatModelHeaderMarkdown(result.modelTag) + cleanedText,
+          threadId,
+        );
       }
       for (const fp of filePaths) {
         try {
@@ -855,8 +1028,45 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
           await sendMessage(config.token, chatId, `Failed to send file: ${fp.split("/").pop()}`, threadId);
         }
       }
-      if (!cleanedText && filePaths.length === 0) {
-        await sendMessage(config.token, chatId, "(empty response)", threadId);
+
+      const settings = getSettings();
+      const imgKey = resolveImageGenApiKey(settings);
+      if (
+        settings.imageGen.enabled &&
+        imgKey &&
+        imagePrompts.length > 0
+      ) {
+        for (const imgPrompt of imagePrompts.slice(0, MAX_GENERATE_IMAGES_PER_MESSAGE)) {
+          try {
+            const generated = await generateImageOpenRouter(imgKey, settings.imageGen.model, imgPrompt);
+            if (generated) {
+              const ext = extFromImageMime(generated.mime);
+              await sendPhotoBytes(
+                config.token,
+                chatId,
+                generated.bytes,
+                `claudeclaw-${Date.now()}${ext}`,
+                generated.mime,
+                imgPrompt.length > 180 ? `${imgPrompt.slice(0, 177)}…` : imgPrompt,
+                threadId,
+              );
+            } else {
+              await sendMessage(config.token, chatId, "⚠️ Non sono riuscito a generare l’immagine.", threadId);
+            }
+          } catch (err) {
+            console.error(`[Telegram] Image gen: ${err instanceof Error ? err.message : err}`);
+            await sendMessage(config.token, chatId, "⚠️ Errore invio immagine su Telegram.", threadId);
+          }
+        }
+      }
+
+      if (!cleanedText && filePaths.length === 0 && imagePrompts.length === 0) {
+        await sendMessage(
+          config.token,
+          chatId,
+          formatModelHeaderMarkdown(result.modelTag) + "Ricevuto.",
+          threadId,
+        );
       }
     }
   } catch (err) {
@@ -915,8 +1125,12 @@ async function registerBotCommands(token: string): Promise<void> {
     const commands = [
       { command: "start", description: "Show welcome message" },
       { command: "reset", description: "Reset session and start fresh" },
+      { command: "interrupt", description: "Interrupt the currently running Claude task" },
       { command: "compact", description: "Compact session to reduce context size" },
       { command: "status", description: "Show current session status" },
+      { command: "usefallback", description: "Force all messages through fallback model" },
+      { command: "useprimary", description: "Switch back to primary model" },
+      { command: "setfallback", description: "Set the OpenRouter fallback model (e.g. openrouter/google/gemini-2.5-pro)" },
       { command: "context", description: "Show context window usage" },
     ];
     for (const skill of skills) {
@@ -940,7 +1154,7 @@ async function registerBotCommands(token: string): Promise<void> {
     } catch (regErr) {
       // Skill-generated commands may violate Telegram constraints; retry with built-in commands only
       console.warn(`[Telegram] Full command registration failed, retrying with built-in commands only: ${regErr instanceof Error ? regErr.message : regErr}`);
-      const builtinOnly = commands.filter((c) => ["start", "reset", "compact", "status", "context"].includes(c.command));
+      const builtinOnly = commands.filter((c) => ["start", "reset", "interrupt", "compact", "status", "context"].includes(c.command));
       await callApi(token, "setMyCommands", { commands: builtinOnly });
       console.log(`  Commands registered (built-in only): ${builtinOnly.length}`);
     }
