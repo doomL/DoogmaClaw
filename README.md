@@ -1,145 +1,76 @@
 <p align="center">
-  <img src="images/claudeclaw-banner.svg" alt="ClaudeClaw Banner" />
+  <img src="images/claudeclaw-banner.svg" alt="DoogmaClaw Banner" />
 </p>
 <p align="center">
-  <img src="images/claudeclaw-wordmark.png" alt="ClaudeClaw Wordmark" />
+  <img src="images/claudeclaw-wordmark.png" alt="DoogmaClaw Wordmark" />
 </p>
 
 <p align="center">
   <img src="https://awesome.re/badge.svg" alt="Awesome" />
-  <a href="https://github.com/moazbuilds/ClaudeClaw/stargazers">
-    <img src="https://img.shields.io/github/stars/moazbuilds/ClaudeClaw?style=flat-square&color=f59e0b" alt="GitHub Stars" />
+  <a href="https://github.com/doomL/DoogmaClaw/stargazers">
+    <img src="https://img.shields.io/github/stars/doomL/DoogmaClaw?style=flat-square&color=f59e0b" alt="GitHub Stars" />
   </a>
-  <a href="https://github.com/moazbuilds/ClaudeClaw">
-    <img src="https://img.shields.io/static/v1?label=downloads&message=~15k%20every%2014%20days&color=2da44e&style=flat-square" alt="Downloads ~15k every 14 days" />
+  <a href="https://github.com/doomL/DoogmaClaw">
+    <img src="https://img.shields.io/static/v1?label=downloads&message=personal%20fork&color=2da44e&style=flat-square" alt="Downloads" />
   </a>
-  <a href="https://github.com/moazbuilds/ClaudeClaw/commits/master">
-    <img src="https://img.shields.io/github/last-commit/moazbuilds/ClaudeClaw?style=flat-square&color=0ea5e9" alt="Last Commit" />
+  <a href="https://github.com/doomL/DoogmaClaw/commits/master">
+    <img src="https://img.shields.io/github/last-commit/doomL/DoogmaClaw?style=flat-square&color=0ea5e9" alt="Last Commit" />
   </a>
-  <a href="https://github.com/moazbuilds/ClaudeClaw/graphs/contributors">
-    <img src="https://img.shields.io/github/contributors/moazbuilds/ClaudeClaw?style=flat-square&color=a855f7" alt="Contributors" />
-  </a>
-  <a href="https://x.com/moazbuilds">
-    <img src="https://img.shields.io/badge/X-%40moazbuilds-000000?style=flat-square&logo=x" alt="X @moazbuilds" />
+  <a href="https://github.com/doomL/DoogmaClaw/graphs/contributors">
+    <img src="https://img.shields.io/github/contributors/doomL/DoogmaClaw?style=flat-square&color=a855f7" alt="Contributors" />
   </a>
 </p>
 
-<p align="center"><b>A lightweight, open-source OpenClaw version built into your Claude Code.</b></p>
+<p align="center"><b>DoogmaClaw: A personalized, power-user fork of ClaudeClaw.</b></p>
 
-ClaudeClaw turns your Claude Code into a personal assistant that never sleeps. It runs as a background daemon, executing tasks on a schedule, responding to messages on Telegram and Discord, transcribing voice commands, and integrating with any service you need.
+DoogmaClaw is a custom version of ClaudeClaw designed for maximum automation and advanced agentic workflows. It turns Claude Code into a personal assistant that never sleeps, with enhanced capabilities for Telegram, Discord, and complex task scheduling.
 
-> Note: Please don't use ClaudeClaw for hacking any bank system or doing any illegal activities. Thank you.
+## 🚀 Key Enhancements in DoogmaClaw
 
-## Why ClaudeClaw?
+Compared to the original ClaudeClaw, this fork includes:
+- **Advanced Runner Logic:** Overhauled execution flow for better reliability and complex agentic behaviors.
+- **Rich Telegram Integration:** Added support for native Telegram reactions and advanced response formatting.
+- **Agentic Routing:** Enhanced model handling and fallback mechanisms.
+- **Template Configurations:** Includes a `/template` directory with production-ready configurations, custom skills, and automation scripts (e.g., Daily Email Digest).
 
-| Category | ClaudeClaw | OpenClaw |
-| --- | --- | --- |
-| Anthropic Will Come After You | No | Yes |
-| API Overhead | Directly uses your Claude Code subscription | Nightmare |
-| Setup & Installation | ~5 minutes | Nightmare |
-| Deployment | Install Claude Code on any device or VPS and run | Nightmare |
-| Isolation Model | Folder-based and isolated as needed | Global by default (security nightmare) |
-| Reliability | Simple reliable system for agents | Bugs nightmare |
-| Feature Scope | Lightweight features you actually use | 600k+ LOC nightmare |
-| Security | Average Claude Code usage | Nightmare |
-| Cost Efficiency | Efficient usage | Nightmare |
-| Memory | Uses Claude internal memory system + `CLAUDE.md` | Nightmare |
+## 🛠 Getting Started
 
-## Getting Started in 5 Minutes
-
+### Installation
+To use this fork instead of the marketplace version:
 ```bash
-claude plugin marketplace add moazbuilds/claudeclaw
+# Remove original if installed
+claude plugin marketplace remove moazbuilds/claudeclaw
+
+# Add and install DoogmaClaw
+claude plugin marketplace add doomL/DoogmaClaw
 claude plugin install claudeclaw
 ```
-Then open a Claude Code session and run:
+
+Then run:
 ```
 /claudeclaw:start
 ```
-The setup wizard walks you through model, heartbeat, Telegram, Discord, and security, then your daemon is live with a web dashboard.
 
-## What Would Be Built Next?
+### Using the Templates
+The `/template` folder contains example setups. You can copy these to your `~/.claude/` directory to quickly get started with advanced automations.
 
-> **Mega Post:** Help shape the next ClaudeClaw features.
-> Vote, suggest ideas, and discuss priorities in **[this post](https://github.com/moazbuilds/claudeclaw/issues/14)**.
-
-<p align="center">
-  <a href="https://github.com/moazbuilds/claudeclaw/issues/14">
-    <img src="https://img.shields.io/badge/Roadmap-Mega%20Post-blue?style=for-the-badge&logo=github" alt="Roadmap Mega Post" />
-  </a>
-</p>
-
-## Features
+## Features (Inherited & Enhanced)
 
 ### Automation
-- **Heartbeat:** Periodic check-ins with configurable intervals, quiet hours, and editable prompts.
-- **Cron Jobs:** Timezone-aware schedules for repeating or one-time tasks with reliable execution.
+- **Heartbeat:** Periodic check-ins with configurable intervals and custom prompts.
+- **Cron Jobs:** Timezone-aware schedules for repeating or one-time tasks.
 
 ### Communication
-- **Telegram:** Text, image, and voice support.
-- **Discord:** DMs, server mentions/replies, slash commands, voice messages, and image attachments.
-- **Time Awareness:** Message time prefixes help the agent understand delays and daily patterns.
-
-### Multi-Session Threads (Discord)
-- **Independent Thread Sessions:** Each Discord thread gets its own Claude CLI session, fully isolated from the main channel.
-- **Parallel Processing:** Thread conversations run concurrently — messages in different threads don't block each other.
-- **Auto-Create:** First message in a new thread automatically bootstraps a fresh session. No setup needed.
-- **Session Cleanup:** Thread sessions are automatically cleaned up when threads are deleted or archived.
-- **Backward Compatible:** DMs and main channel messages continue using the global session.
-
-See [docs/MULTI_SESSION.md](docs/MULTI_SESSION.md) for technical details.
+- **Telegram:** Text, image, and voice support + native reactions.
+- **Discord:** DMs, server mentions, slash commands, and isolated thread sessions.
 
 ### Reliability and Control
-- **GLM Fallback:** Automatically continue with GLM models if your primary limit is reached.
-- **Web Dashboard:** Manage jobs, monitor runs, and inspect logs in real time.
-- **Security Levels:** Four access levels from read-only to full system access.
-- **Model Selection:** Switch models based on your workload.
-
-## FAQ
-
-<details open>
-  <summary><strong>Can ClaudeClaw do &lt;something&gt;?</strong></summary>
-  <p>
-    If Claude Code can do it, ClaudeClaw can do it too. ClaudeClaw adds cron jobs,
-    heartbeats, and Telegram/Discord bridges on top. You can also give your ClaudeClaw new
-    skills and teach it custom workflows.
-  </p>
-</details>
-
-<details open>
-  <summary><strong>Is this project breaking Anthropic ToS?</strong></summary>
-  <p>
-    No. ClaudeClaw is local usage inside the Claude Code ecosystem. It wraps Claude Code
-    directly and does not require third-party OAuth outside that flow.
-    If you build your own scripts to do the same thing, it would be the same.
-  </p>
-</details>
-
-<details open>
-  <summary><strong>Will Anthropic sue you for building ClaudeClaw?</strong></summary>
-  <p>
-    I hope not.
-  </p>
-</details>
-
-<details open>
-  <summary><strong>Are you ready to change this project name?</strong></summary>
-  <p>
-    If it bothers Anthropic, I might rename it to OpenClawd. Not sure yet.
-  </p>
-</details>
-
-## Screenshots
-
-### Claude Code Folder-Based Status Bar
-![Claude Code folder-based status bar](images/bar.png)
-
-### Cool UI to Manage and Check Your ClaudeClaw
-![Cool UI to manage and check your ClaudeClaw](images/dashboard.png)
+- **Web Dashboard:** Real-time management of jobs and logs.
+- **Security Levels:** Granular access control from read-only to full system access.
 
 ## Contributors
+Based on the original work by [moazbuilds](https://github.com/moazbuilds/claudeclaw).
 
-Thanks for helping make ClaudeClaw better.
-
-<a href="https://github.com/moazbuilds/claudeclaw/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=moazbuilds/claudeclaw" />
+<a href="https://github.com/doomL/DoogmaClaw/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=doomL/DoogmaClaw" />
 </a>
