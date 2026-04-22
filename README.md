@@ -30,6 +30,7 @@ DoogmaClaw is a custom version of ClaudeClaw designed for maximum automation and
 Compared to the original ClaudeClaw, this fork includes:
 
 - **OpenRouter Integration:** Native support for OpenRouter, allowing the use of any LLM as primary or fallback (e.g., Nemotron, Llama 3, GPT-4o) without changing the core setup.
+- **Robust Fallback System:** Fixed critical bugs during model switching (e.g., "Error 1" related to thinking blocks) to ensure seamless transitions between primary and fallback models.
 - **Advanced Runner Logic:** Overhauled execution flow for better reliability, handling of complex agentic behaviors, and session transcript management.
 - **Rich Telegram Interface:** 
   - **Native Reactions:** Support for `[react:emoji]` tags in responses.
