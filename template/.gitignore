@@ -1,0 +1,5 @@
+*.env
+*.log
+
+# Script credentials (copy from *.template.json and fill in your values)
+scripts/email_config.json

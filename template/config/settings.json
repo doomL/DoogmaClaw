@@ -1,0 +1,13 @@
+{
+  "extraKnownMarketplaces": {
+    "claudeclaw": {
+      "source": {
+        "source": "github",
+        "repo": "moazbuilds/claudeclaw"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "claudeclaw@claudeclaw": true
+  }
+}

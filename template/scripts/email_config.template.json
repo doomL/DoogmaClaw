@@ -1,0 +1,18 @@
+{
+  "accounts": [
+    {
+      "label": "Gmail Personal",
+      "email": "your.email@gmail.com",
+      "password": "xxxx xxxx xxxx xxxx",
+      "imap_host": "imap.gmail.com",
+      "imap_port": 993
+    },
+    {
+      "label": "Gmail Work",
+      "email": "work.email@gmail.com",
+      "password": "xxxx xxxx xxxx xxxx",
+      "imap_host": "imap.gmail.com",
+      "imap_port": 993
+    }
+  ]
+}

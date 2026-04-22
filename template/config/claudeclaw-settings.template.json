@@ -1,0 +1,30 @@
+{
+  "model": "sonnet",
+  "api": "",
+  "fallback": {
+    "model": "",
+    "api": ""
+  },
+  "sessionTimeoutMs": 900000,
+  "timezone": "UTC",
+  "heartbeat": {
+    "enabled": false,
+    "interval": 600,
+    "prompt": "",
+    "forwardToTelegram": true
+  },
+  "telegram": {
+    "token": "YOUR_BOT_TOKEN_HERE",
+    "allowedUserIds": [123456789]
+  },
+  "web": {
+    "enabled": false,
+    "host": "127.0.0.1",
+    "port": 4632
+  },
+  "security": {
+    "level": "moderate",
+    "allowedTools": [],
+    "disallowedTools": []
+  }
+}
