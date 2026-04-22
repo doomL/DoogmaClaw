@@ -28,10 +28,13 @@ DoogmaClaw is a custom version of ClaudeClaw designed for maximum automation and
 ## 🚀 Key Enhancements in DoogmaClaw
 
 Compared to the original ClaudeClaw, this fork includes:
-- **Advanced Runner Logic:** Overhauled execution flow for better reliability and complex agentic behaviors.
-- **Rich Telegram Integration:** Added support for native Telegram reactions and advanced response formatting.
-- **Agentic Routing:** Enhanced model handling and fallback mechanisms.
-- **Template Configurations:** Includes a `/template` directory with production-ready configurations, custom skills, and automation scripts (e.g., Daily Email Digest).
+
+- **OpenRouter Integration:** Native support for OpenRouter, allowing the use of any LLM as primary or fallback (e.g., Nemotron, Llama 3, GPT-4o) without changing the core setup.
+- **Advanced Runner Logic:** Overhauled execution flow for better reliability, handling of complex agentic behaviors, and session transcript management.
+- **Rich Telegram Interface:** 
+  - **Native Reactions:** Support for `[react:emoji]` tags in responses.
+  - **Direct Control:** New Telegram commands to set fallbacks on-the-fly, stop running tasks, and manage session state directly from the chat.
+- **Template Ecosystem:** Includes a `/template` directory with production-ready configurations, custom skills, and automation scripts (e.g., Daily Email Digest via IMAP).
 
 ## 🛠 Getting Started
 
@@ -61,7 +64,7 @@ The `/template` folder contains example setups. You can copy these to your `~/.c
 - **Cron Jobs:** Timezone-aware schedules for repeating or one-time tasks.
 
 ### Communication
-- **Telegram:** Text, image, and voice support + native reactions.
+- **Telegram:** Text, image, and voice support + native reactions + control commands.
 - **Discord:** DMs, server mentions, slash commands, and isolated thread sessions.
 
 ### Reliability and Control
