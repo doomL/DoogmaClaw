@@ -196,6 +196,11 @@ function untrackActiveClaudeProcess(proc: ReturnType<typeof Bun.spawn>): void {
   activeClaudeProcesses.delete(pid);
 }
 
+/** True while a Claude subprocess is running (main queue). */
+export function isMainBusy(): boolean {
+  return activeClaudeProcesses.size > 0;
+}
+
 export function interruptActiveRuns(reason: string = "manual interrupt"): {
   interrupted: number;
   details: string[];
@@ -246,14 +251,25 @@ function isOpenAiCompatTranscriptError(stdout: string, stderr: string): boolean 
   );
 }
 
+/** Resuming on Anthropic after fallback wrote non-Anthropic ids (e.g. gen-*) breaks diagnostics.previous_message_id. */
+function isAnthropicPreviousMessageIdError(stdout: string, stderr: string): boolean {
+  const t = `${stdout}\n${stderr}`;
+  return (
+    /diagnostics\.previous_message_id/i.test(t) ||
+    /previous_message_id.*must be the [`']?id[`']? from a prior/i.test(t)
+  );
+}
+
 function buildClaudeInvokeArgs(
   prompt: string,
   securityArgs: string[],
   appendSystemPrompt: string,
   resumeSessionId: string | null,
+  useStreamJson = false,
 ): string[] {
-  const outputFormat = resumeSessionId ? "text" : "json";
+  const outputFormat = useStreamJson ? "stream-json" : resumeSessionId ? "text" : "json";
   const args = ["claude", "-p", prompt, "--output-format", outputFormat, ...securityArgs];
+  if (useStreamJson) args.push("--verbose");
   if (resumeSessionId) args.push("--resume", resumeSessionId);
   if (appendSystemPrompt.trim()) {
     args.push("--append-system-prompt", appendSystemPrompt);
@@ -366,6 +382,176 @@ async function runClaudeOnce(
       exitCode: 124,
     };
   }
+}
+
+function formatToolCallSummary(name: string, input: Record<string, unknown>): string {
+  const s = (v: unknown, max = 50) => String(v ?? "").slice(0, max);
+  switch (name) {
+    case "Write":
+    case "Edit":
+    case "Read":
+      return `${name}(${s(input.file_path)})`;
+    case "Bash":
+      return `Bash(${s(input.command, 60)})`;
+    case "Grep":
+      return `Grep(${s(input.pattern)} in ${s(input.path ?? ".")})`;
+    case "Glob":
+      return `Glob(${s(input.pattern)})`;
+    case "WebSearch":
+      return `WebSearch(${s(input.query)})`;
+    case "WebFetch":
+      return `WebFetch(${s(input.url, 60)})`;
+    default:
+      return `${name}(...)`;
+  }
+}
+
+function extractToolResultText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return (content as Array<{ type?: string; text?: string }>)
+      .filter((b) => b.type === "text")
+      .map((b) => b.text ?? "")
+      .join("");
+  }
+  return String(content ?? "");
+}
+
+/** stream-json with live chunk/tool callbacks; returns final result text and optional session id. */
+async function runClaudeStream(
+  baseArgs: string[],
+  model: string,
+  api: string,
+  baseEnv: Record<string, string>,
+  timeoutMs: number = CLAUDE_TIMEOUT_MS,
+  onChunk?: (text: string) => void,
+  onToolEvent?: (line: string) => void,
+): Promise<{ rawStdout: string; stderr: string; exitCode: number; sessionId?: string }> {
+  const args = [...baseArgs];
+  const mArg = claudeCliModelArg(model);
+  if (mArg) args.push("--model", mArg);
+
+  const proc = Bun.spawn(args, {
+    stdout: "pipe",
+    stderr: "pipe",
+    env: buildChildEnv(baseEnv, model, api),
+  });
+  trackActiveClaudeProcess(proc, "runClaudeStream");
+
+  let sessionId: string | undefined;
+  let resultText = "";
+  let stderr = "";
+  let streamDelivered = "";
+  let streamLastMsgId = "";
+  const streamPendingToolCalls = new Map<string, string>();
+
+  const readStdout = async () => {
+    const reader = proc.stdout.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split("\n");
+      buf = lines.pop() ?? "";
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+          const event = JSON.parse(trimmed) as Record<string, unknown>;
+          if (
+            (event.type === "system" || event.type === "result") &&
+            typeof event.session_id === "string"
+          ) {
+            sessionId = event.session_id;
+          }
+          if (event.type === "result" && typeof event.result === "string") {
+            resultText = event.result;
+          }
+          if ((onChunk || onToolEvent) && event.type === "assistant") {
+            const msg = event.message as { id?: string; content?: Array<Record<string, unknown>> } | undefined;
+            const content = msg?.content ?? [];
+            const msgId = msg?.id ?? "";
+            if (msgId !== streamLastMsgId) {
+              if (onChunk && streamDelivered) onChunk("\n");
+              streamDelivered = "";
+              streamLastMsgId = msgId;
+            }
+            let full = "";
+            for (const block of content) {
+              if (block.type === "text" && typeof block.text === "string") {
+                full += block.text;
+              } else if (block.type === "tool_use" && onToolEvent) {
+                const id = String(block.id ?? "");
+                const name = String(block.name ?? "?");
+                if (id) streamPendingToolCalls.set(id, name);
+                onToolEvent(`● ${formatToolCallSummary(name, (block.input as Record<string, unknown>) ?? {})}`);
+              }
+            }
+            if (onChunk && full.length > streamDelivered.length) {
+              onChunk(full.slice(streamDelivered.length));
+              streamDelivered = full;
+            }
+          }
+          if (onToolEvent && event.type === "user") {
+            const content = (event.message as { content?: Array<Record<string, unknown>> } | undefined)?.content ?? [];
+            for (const block of content) {
+              if (block.type === "tool_result") {
+                const toolName = streamPendingToolCalls.get(String(block.tool_use_id ?? "")) ?? "?";
+                streamPendingToolCalls.delete(String(block.tool_use_id ?? ""));
+                const text = extractToolResultText(block.content);
+                const firstLine = text.split("\n")[0].slice(0, 80);
+                const summary = block.is_error ? `Error: ${firstLine}` : firstLine || "done";
+                onToolEvent(`  ⎿  [${toolName}] ${summary}`);
+              }
+            }
+          }
+        } catch {}
+      }
+    }
+  };
+
+  const readStderr = async () => {
+    stderr = await new Response(proc.stderr).text();
+  };
+
+  let timeoutId: ReturnType<typeof setTimeout> | null = null;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(() => reject(new Error(`Claude session timed out after ${timeoutMs / 1000}s`)), timeoutMs);
+  });
+
+  try {
+    await Promise.race([Promise.all([readStdout(), readStderr()]), timeoutPromise]);
+    if (timeoutId) clearTimeout(timeoutId);
+    await proc.exited;
+    untrackActiveClaudeProcess(proc);
+    return { rawStdout: resultText, stderr: stderr.trim(), exitCode: proc.exitCode ?? 1, sessionId };
+  } catch (err) {
+    if (timeoutId) clearTimeout(timeoutId);
+    try { proc.kill("SIGTERM"); } catch {}
+    setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} }, 5000);
+    untrackActiveClaudeProcess(proc);
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[${new Date().toLocaleTimeString()}] ${message}`);
+    return { rawStdout: "", stderr: message, exitCode: 124, sessionId };
+  }
+}
+
+type ClaudeInvokeResult = { rawStdout: string; stderr: string; exitCode: number; sessionId?: string };
+
+async function invokeClaude(
+  baseArgs: string[],
+  model: string,
+  api: string,
+  baseEnv: Record<string, string>,
+  timeoutMs: number,
+  stream?: { onChunk?: (text: string) => void; onToolEvent?: (line: string) => void },
+): Promise<ClaudeInvokeResult> {
+  if (stream?.onChunk || stream?.onToolEvent) {
+    return runClaudeStream(baseArgs, model, api, baseEnv, timeoutMs, stream.onChunk, stream.onToolEvent);
+  }
+  return runClaudeOnce(baseArgs, model, api, baseEnv, timeoutMs);
 }
 
 const PROJECT_DIR = process.cwd();
@@ -541,7 +727,13 @@ export async function compactCurrentSession(): Promise<{ success: boolean; messa
     : { success: false, message: `❌ Compact failed (${existing.sessionId.slice(0, 8)})` };
 }
 
-async function execClaude(name: string, prompt: string, threadId?: string): Promise<RunResult> {
+async function execClaude(
+  name: string,
+  prompt: string,
+  threadId?: string,
+  onChunk?: (text: string) => void,
+  onToolEvent?: (line: string) => void,
+): Promise<RunResult> {
   await mkdir(LOGS_DIR, { recursive: true });
 
   const existing = threadId
@@ -608,13 +800,15 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
   if (security.level !== "unrestricted") appendParts.push(DIR_SCOPE_PROMPT);
   const appendSystemPrompt = appendParts.join("\n\n");
   const resumeSessionId = !isNew ? existing.sessionId : null;
-  let args = buildClaudeInvokeArgs(prompt, securityArgs, appendSystemPrompt, resumeSessionId);
+  const useStreamJson = Boolean(onChunk || onToolEvent);
+  let args = buildClaudeInvokeArgs(prompt, securityArgs, appendSystemPrompt, resumeSessionId, useStreamJson);
+  const streamCb = useStreamJson ? { onChunk, onToolEvent } : undefined;
 
   // Strip CLAUDECODE env var so child claude processes don't think they're nested
   const { CLAUDECODE: _, ...cleanEnv } = process.env;
   const baseEnv = { ...cleanEnv } as Record<string, string>;
 
-  let exec = await runClaudeOnce(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs);
+  let exec = await invokeClaude(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs, streamCb);
   const primaryRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
   let usedFallback = false;
   let usedFreshSessionStart = false;
@@ -631,20 +825,33 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
           `[${new Date().toLocaleTimeString()}] Repaired session transcript for fallback API (merged ${repair.rowsMerged} assistant streaming row(s), stripped ${repair.blocksRemoved} reasoning block(s)).`
         );
       }
-      args = buildClaudeInvokeArgs(prompt, securityArgs, appendSystemPrompt, resumeSessionId);
-      exec = await runClaudeOnce(args, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs);
+      args = buildClaudeInvokeArgs(prompt, securityArgs, appendSystemPrompt, resumeSessionId, useStreamJson);
+      exec = await invokeClaude(args, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs, streamCb);
       if (exec.exitCode !== 0) {
         console.warn(
           `[${new Date().toLocaleTimeString()}] Fallback --resume still failed; starting a new Claude session (this message only).`
         );
-        args = buildClaudeInvokeArgs(prompt, securityArgs, appendSystemPrompt, null);
-        exec = await runClaudeOnce(args, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs);
+        args = buildClaudeInvokeArgs(prompt, securityArgs, appendSystemPrompt, null, useStreamJson);
+        exec = await invokeClaude(args, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs, streamCb);
         usedFreshSessionStart = true;
       }
     } else {
-      args = buildClaudeInvokeArgs(prompt, securityArgs, appendSystemPrompt, resumeSessionId);
-      exec = await runClaudeOnce(args, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs);
+      args = buildClaudeInvokeArgs(prompt, securityArgs, appendSystemPrompt, resumeSessionId, useStreamJson);
+      exec = await invokeClaude(args, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs, streamCb);
     }
+  } else if (
+    exec.exitCode !== 0 &&
+    !primaryRateLimit &&
+    resumeSessionId &&
+    !isNew &&
+    isAnthropicPreviousMessageIdError(exec.rawStdout, exec.stderr)
+  ) {
+    console.warn(
+      `[${new Date().toLocaleTimeString()}] Session transcript has non-Anthropic message ids (likely after fallback); starting fresh primary session.`,
+    );
+    args = buildClaudeInvokeArgs(prompt, securityArgs, appendSystemPrompt, null, useStreamJson);
+    exec = await invokeClaude(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs, streamCb);
+    usedFreshSessionStart = true;
   } else if (
     exec.exitCode !== 0 &&
     !primaryRateLimit &&
@@ -656,14 +863,14 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
       console.warn(
         `[${new Date().toLocaleTimeString()}] Repaired transcript after thinking/signature error (merged ${repair.rowsMerged} row(s), stripped ${repair.blocksRemoved} block(s)); retrying primary with --resume.`
       );
-      exec = await runClaudeOnce(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs);
+      exec = await invokeClaude(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs, streamCb);
     }
     if (exec.exitCode !== 0) {
       console.warn(
         `[${new Date().toLocaleTimeString()}] Thinking/signature issue persists; starting a fresh session.`
       );
-      args = buildClaudeInvokeArgs(prompt, securityArgs, appendSystemPrompt, null);
-      exec = await runClaudeOnce(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs);
+      args = buildClaudeInvokeArgs(prompt, securityArgs, appendSystemPrompt, null, useStreamJson);
+      exec = await invokeClaude(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs, streamCb);
       usedFreshSessionStart = true;
     }
   } else if (
@@ -678,7 +885,7 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
       console.warn(
         `[${new Date().toLocaleTimeString()}] Repaired transcript after OpenAI-compat provider error; retrying with --resume.`
       );
-      exec = await runClaudeOnce(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs);
+      exec = await invokeClaude(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs, streamCb);
     }
     if (exec.exitCode !== 0 && hasModelConfig(fallbackConfig) && !sameModelConfig(primaryConfig, fallbackConfig)) {
       const repairFb = await repairSessionJsonlForCompatGateways(resumeSessionId);
@@ -688,10 +895,10 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
         );
       }
       usedFallback = true;
-      exec = await runClaudeOnce(args, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs);
+      exec = await invokeClaude(args, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs, streamCb);
       if (exec.exitCode !== 0) {
-        args = buildClaudeInvokeArgs(prompt, securityArgs, appendSystemPrompt, null);
-        exec = await runClaudeOnce(args, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs);
+        args = buildClaudeInvokeArgs(prompt, securityArgs, appendSystemPrompt, null, useStreamJson);
+        exec = await invokeClaude(args, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs, streamCb);
         usedFreshSessionStart = true;
       }
     }
@@ -700,8 +907,8 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
       console.warn(
         `[${new Date().toLocaleTimeString()}] No separate fallback; starting fresh primary session after transcript error.`
       );
-      args = buildClaudeInvokeArgs(prompt, securityArgs, appendSystemPrompt, null);
-      exec = await runClaudeOnce(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs);
+      args = buildClaudeInvokeArgs(prompt, securityArgs, appendSystemPrompt, null, useStreamJson);
+      exec = await invokeClaude(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs, streamCb);
       usedFreshSessionStart = true;
     }
   }
@@ -729,19 +936,19 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
           `[${new Date().toLocaleTimeString()}] Repaired session transcript for fallback API (merged ${repairLate.rowsMerged} assistant streaming row(s), stripped ${repairLate.blocksRemoved} reasoning block(s)).`,
         );
       }
-      args = buildClaudeInvokeArgs(prompt, securityArgs, appendSystemPrompt, rid);
-      exec = await runClaudeOnce(args, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs);
+      args = buildClaudeInvokeArgs(prompt, securityArgs, appendSystemPrompt, rid, useStreamJson);
+      exec = await invokeClaude(args, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs, streamCb);
       if (exec.exitCode !== 0) {
         console.warn(
           `[${new Date().toLocaleTimeString()}] Fallback --resume still failed; starting a new Claude session (this message only).`,
         );
-        args = buildClaudeInvokeArgs(prompt, securityArgs, appendSystemPrompt, null);
-        exec = await runClaudeOnce(args, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs);
+        args = buildClaudeInvokeArgs(prompt, securityArgs, appendSystemPrompt, null, useStreamJson);
+        exec = await invokeClaude(args, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs, streamCb);
         usedFreshSessionStart = true;
       }
     } else {
-      args = buildClaudeInvokeArgs(prompt, securityArgs, appendSystemPrompt, null);
-      exec = await runClaudeOnce(args, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs);
+      args = buildClaudeInvokeArgs(prompt, securityArgs, appendSystemPrompt, null, useStreamJson);
+      exec = await invokeClaude(args, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs, streamCb);
       if (exec.exitCode !== 0) usedFreshSessionStart = true;
     }
   }
@@ -757,13 +964,18 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
     stdout = rateLimitMessage;
   }
 
-  // New session or fresh restart: JSON output with session_id
+  // New session or fresh restart: capture session_id from stream-json or JSON output
   if (!rateLimitMessage && exitCode === 0 && (isNew || usedFreshSessionStart)) {
-    try {
-      const json = JSON.parse(rawStdout);
-      sessionId = json.session_id;
-      stdout = json.result ?? "";
-      // Save the real session ID from Claude Code
+    let newSessionId = exec.sessionId;
+    if (!newSessionId && !useStreamJson) {
+      try {
+        const json = JSON.parse(rawStdout) as { session_id?: string; result?: string };
+        newSessionId = json.session_id;
+        if (!stdout.trim() && typeof json.result === "string") stdout = json.result;
+      } catch {}
+    }
+    if (newSessionId) {
+      sessionId = newSessionId;
       if (threadId) {
         await createThreadSession(threadId, sessionId);
         console.log(`[${new Date().toLocaleTimeString()}] Thread session created: ${sessionId} (thread ${threadId.slice(0, 8)})`);
@@ -771,8 +983,8 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
         await createSession(sessionId);
         console.log(`[${new Date().toLocaleTimeString()}] Session created: ${sessionId}`);
       }
-    } catch (e) {
-      console.error(`[${new Date().toLocaleTimeString()}] Failed to parse session from Claude output:`, e);
+    } else if (!useStreamJson) {
+      console.error(`[${new Date().toLocaleTimeString()}] Failed to parse session from Claude output`);
     }
   }
 
@@ -845,7 +1057,7 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
 
     if (compactOk) {
       console.log(`[${new Date().toLocaleTimeString()}] Retrying ${name} after compact...`);
-      const retryExec = await runClaudeOnce(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs);
+      const retryExec = await invokeClaude(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs, streamCb);
       const retryResult: RunResult = {
         stdout: retryExec.rawStdout,
         stderr: retryExec.stderr,
@@ -873,8 +1085,8 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
         `[${new Date().toLocaleTimeString()}] Timeout recovery: trying fallback with fresh session...`
       );
       usedFallback = true;
-      const fbArgs = buildClaudeInvokeArgs(prompt, securityArgs, appendSystemPrompt, null);
-      exec = await runClaudeOnce(fbArgs, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs);
+      const fbArgs = buildClaudeInvokeArgs(prompt, securityArgs, appendSystemPrompt, null, useStreamJson);
+      exec = await invokeClaude(fbArgs, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs, streamCb);
       usedFreshSessionStart = true;
     }
   }
@@ -900,8 +1112,14 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
   return result;
 }
 
-export async function run(name: string, prompt: string, threadId?: string): Promise<RunResult> {
-  return enqueue(() => execClaude(name, prompt, threadId), threadId);
+export async function run(
+  name: string,
+  prompt: string,
+  threadId?: string,
+  onChunk?: (text: string) => void,
+  onToolEvent?: (line: string) => void,
+): Promise<RunResult> {
+  return enqueue(() => execClaude(name, prompt, threadId, onChunk, onToolEvent), threadId);
 }
 
 async function streamClaude(
@@ -1048,8 +1266,14 @@ function prefixUserMessageWithClock(prompt: string): string {
   }
 }
 
-export async function runUserMessage(name: string, prompt: string, threadId?: string): Promise<RunResult> {
-  return run(name, prefixUserMessageWithClock(prompt), threadId);
+export async function runUserMessage(
+  name: string,
+  prompt: string,
+  threadId?: string,
+  onChunk?: (text: string) => void,
+  onToolEvent?: (line: string) => void,
+): Promise<RunResult> {
+  return run(name, prefixUserMessageWithClock(prompt), threadId, onChunk, onToolEvent);
 }
 
 /**
