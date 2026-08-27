@@ -15,6 +15,8 @@ import {
   extractLastVisibleAssistantTextFromSessionJsonl,
   isPlaceholderAssistantOutput,
   repairSessionJsonlForCompatGateways,
+  sessionHasNonAnthropicAssistantIds,
+  truncateSessionJsonlAfterLastAnthropicMessage,
 } from "./sessionTranscript";
 
 const LOGS_DIR = join(process.cwd(), ".claude/claudeclaw/logs");
@@ -733,6 +735,7 @@ async function execClaude(
   threadId?: string,
   onChunk?: (text: string) => void,
   onToolEvent?: (line: string) => void,
+  onStreamReset?: () => void,
 ): Promise<RunResult> {
   await mkdir(LOGS_DIR, { recursive: true });
 
@@ -774,10 +777,6 @@ async function execClaude(
   const securityArgs = buildSecurityArgs(security);
   const timeoutMs = settings.sessionTimeoutMs;
 
-  console.log(
-    `[${new Date().toLocaleTimeString()}] Running: ${name} (${isNew ? "new session" : `resume ${existing.sessionId.slice(0, 8)}`}, security: ${security.level})`
-  );
-
   // Build the appended system prompt: prompt files + directory scoping
   // This is passed on EVERY invocation (not just new sessions) because
   // --append-system-prompt does not persist across --resume.
@@ -801,7 +800,32 @@ async function execClaude(
   const appendSystemPrompt = appendParts.join("\n\n");
   const resumeSessionId = !isNew ? existing.sessionId : null;
   const useStreamJson = Boolean(onChunk || onToolEvent);
-  let args = buildClaudeInvokeArgs(prompt, securityArgs, appendSystemPrompt, resumeSessionId, useStreamJson);
+  let effectiveResumeId = resumeSessionId;
+  let usedFallback = false;
+  let usedFreshSessionStart = false;
+
+  if (effectiveResumeId && !isNew && !(isForceFallbackMode() && hasModelConfig(fallbackConfig))) {
+    if (await sessionHasNonAnthropicAssistantIds(effectiveResumeId)) {
+      const trunc = await truncateSessionJsonlAfterLastAnthropicMessage(effectiveResumeId);
+      if (trunc.ok && trunc.removedLines > 0) {
+        console.warn(
+          `[${new Date().toLocaleTimeString()}] Truncated ${trunc.removedLines} non-Anthropic transcript row(s) before primary --resume.`,
+        );
+      } else {
+        console.warn(
+          `[${new Date().toLocaleTimeString()}] Session has fallback message ids and cannot resume on Anthropic; starting fresh primary session.`,
+        );
+        effectiveResumeId = null;
+        usedFreshSessionStart = true;
+      }
+    }
+  }
+
+  console.log(
+    `[${new Date().toLocaleTimeString()}] Running: ${name} (${isNew ? "new session" : effectiveResumeId ? `resume ${existing!.sessionId.slice(0, 8)}` : `fresh restart (was ${existing!.sessionId.slice(0, 8)})`}, security: ${security.level})`
+  );
+
+  let args = buildClaudeInvokeArgs(prompt, securityArgs, appendSystemPrompt, effectiveResumeId, useStreamJson);
   const streamCb = useStreamJson ? { onChunk, onToolEvent } : undefined;
 
   // Strip CLAUDECODE env var so child claude processes don't think they're nested
@@ -810,8 +834,6 @@ async function execClaude(
 
   let exec = await invokeClaude(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs, streamCb);
   const primaryRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
-  let usedFallback = false;
-  let usedFreshSessionStart = false;
 
   if (primaryRateLimit && hasModelConfig(fallbackConfig) && !sameModelConfig(primaryConfig, fallbackConfig)) {
     console.warn(
@@ -846,12 +868,23 @@ async function execClaude(
     !isNew &&
     isAnthropicPreviousMessageIdError(exec.rawStdout, exec.stderr)
   ) {
-    console.warn(
-      `[${new Date().toLocaleTimeString()}] Session transcript has non-Anthropic message ids (likely after fallback); starting fresh primary session.`,
-    );
-    args = buildClaudeInvokeArgs(prompt, securityArgs, appendSystemPrompt, null, useStreamJson);
-    exec = await invokeClaude(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs, streamCb);
-    usedFreshSessionStart = true;
+    onStreamReset?.();
+    const trunc = await truncateSessionJsonlAfterLastAnthropicMessage(resumeSessionId);
+    if (trunc.ok && trunc.removedLines > 0) {
+      console.warn(
+        `[${new Date().toLocaleTimeString()}] Repaired transcript after previous_message_id error (removed ${trunc.removedLines} row(s)); retrying primary with --resume.`,
+      );
+      args = buildClaudeInvokeArgs(prompt, securityArgs, appendSystemPrompt, resumeSessionId, useStreamJson);
+      exec = await invokeClaude(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs, streamCb);
+    }
+    if (exec.exitCode !== 0) {
+      console.warn(
+        `[${new Date().toLocaleTimeString()}] Session transcript has non-Anthropic message ids (likely after fallback); starting fresh primary session.`,
+      );
+      args = buildClaudeInvokeArgs(prompt, securityArgs, appendSystemPrompt, null, useStreamJson);
+      exec = await invokeClaude(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs, streamCb);
+      usedFreshSessionStart = true;
+    }
   } else if (
     exec.exitCode !== 0 &&
     !primaryRateLimit &&
@@ -1118,8 +1151,9 @@ export async function run(
   threadId?: string,
   onChunk?: (text: string) => void,
   onToolEvent?: (line: string) => void,
+  onStreamReset?: () => void,
 ): Promise<RunResult> {
-  return enqueue(() => execClaude(name, prompt, threadId, onChunk, onToolEvent), threadId);
+  return enqueue(() => execClaude(name, prompt, threadId, onChunk, onToolEvent, onStreamReset), threadId);
 }
 
 async function streamClaude(
@@ -1272,8 +1306,9 @@ export async function runUserMessage(
   threadId?: string,
   onChunk?: (text: string) => void,
   onToolEvent?: (line: string) => void,
+  onStreamReset?: () => void,
 ): Promise<RunResult> {
-  return run(name, prefixUserMessageWithClock(prompt), threadId, onChunk, onToolEvent);
+  return run(name, prefixUserMessageWithClock(prompt), threadId, onChunk, onToolEvent, onStreamReset);
 }
 
 /**

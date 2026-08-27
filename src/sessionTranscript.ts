@@ -7,13 +7,121 @@ import { join } from "path";
 export function isPlaceholderAssistantOutput(text: string): boolean {
   const t = text.trim();
   if (!t) return false;
-  return /^no response requested\.?$/i.test(t);
+  // "No response requested." is an intentional assistant reply for silent jobs — not a placeholder.
+  if (/^no response requested\.?$/i.test(t)) return false;
+  return false;
 }
 
 /** Same convention as telegram/discord context helpers. */
 export function claudeSessionJsonlPath(sessionId: string, cwd: string = process.cwd()): string {
   const projectSlug = cwd.replace(/\//g, "-");
   return join(homedir(), ".claude", "projects", projectSlug, `${sessionId}.jsonl`);
+}
+
+const ANTHROPIC_ASSISTANT_ID = /^msg_/;
+
+function anthropicAssistantMessageId(obj: Record<string, unknown>): string | null {
+  if (obj.type !== "assistant") return null;
+  const msg = obj.message;
+  if (!msg || typeof msg !== "object") return null;
+  const id = (msg as { id?: unknown }).id;
+  return typeof id === "string" && ANTHROPIC_ASSISTANT_ID.test(id) ? id : null;
+}
+
+function nonAnthropicAssistantMessageId(obj: Record<string, unknown>): string | null {
+  if (obj.type !== "assistant") return null;
+  const msg = obj.message;
+  if (!msg || typeof msg !== "object") return null;
+  const id = (msg as { id?: unknown }).id;
+  if (typeof id !== "string" || !id.trim()) return null;
+  return ANTHROPIC_ASSISTANT_ID.test(id) ? null : id;
+}
+
+/** True when fallback/OpenRouter turns wrote assistant ids that Anthropic --resume rejects. */
+export async function sessionHasNonAnthropicAssistantIds(
+  sessionId: string,
+  cwd?: string,
+): Promise<boolean> {
+  const path = claudeSessionJsonlPath(sessionId, cwd);
+  if (!existsSync(path)) return false;
+
+  let raw: string;
+  try {
+    raw = await readFile(path, "utf8");
+  } catch {
+    return false;
+  }
+
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const obj = JSON.parse(trimmed) as Record<string, unknown>;
+      if (nonAnthropicAssistantMessageId(obj)) return true;
+    } catch {
+      continue;
+    }
+  }
+  return false;
+}
+
+/**
+ * Drop transcript tail after the last Anthropic assistant turn so primary --resume works again
+ * after a fallback model appended gen-* (or other non-msg_) message ids.
+ */
+export async function truncateSessionJsonlAfterLastAnthropicMessage(
+  sessionId: string,
+  cwd?: string,
+): Promise<{ ok: boolean; removedLines: number }> {
+  const path = claudeSessionJsonlPath(sessionId, cwd);
+  if (!existsSync(path)) return { ok: false, removedLines: 0 };
+
+  let raw: string;
+  try {
+    raw = await readFile(path, "utf8");
+  } catch {
+    return { ok: false, removedLines: 0 };
+  }
+
+  const lines = raw.split("\n");
+  let lastAnthropicIdx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i]?.trim();
+    if (!trimmed) continue;
+    try {
+      const obj = JSON.parse(trimmed) as Record<string, unknown>;
+      if (anthropicAssistantMessageId(obj)) lastAnthropicIdx = i;
+    } catch {
+      continue;
+    }
+  }
+
+  if (lastAnthropicIdx === -1) return { ok: false, removedLines: 0 };
+
+  let lastNonEmptyIdx = lines.length - 1;
+  while (lastNonEmptyIdx >= 0 && !lines[lastNonEmptyIdx]?.trim()) lastNonEmptyIdx--;
+  if (lastAnthropicIdx >= lastNonEmptyIdx) return { ok: true, removedLines: 0 };
+
+  const removedLines = lastNonEmptyIdx - lastAnthropicIdx;
+  const backupPath = `${path}.bak-truncate-${Date.now()}`;
+  try {
+    await writeFile(backupPath, raw, "utf8");
+  } catch (e) {
+    console.error(`[${new Date().toLocaleTimeString()}] sessionTranscript: truncate backup failed:`, e);
+    return { ok: false, removedLines: 0 };
+  }
+
+  const kept = lines.slice(0, lastAnthropicIdx + 1);
+  const newBody = kept.join("\n");
+  const withNl = raw.endsWith("\n") ? `${newBody}\n` : newBody;
+  try {
+    await writeFile(path, withNl, "utf8");
+  } catch (e) {
+    console.error(`[${new Date().toLocaleTimeString()}] sessionTranscript: truncate write failed:`, e);
+    return { ok: false, removedLines: 0 };
+  }
+
+  return { ok: true, removedLines };
 }
 
 const REASONING_BLOCK_TYPES = new Set(["thinking", "redacted_thinking"]);

@@ -410,6 +410,151 @@ async function sendDocumentToChat(
   }
 }
 
+/** Per-chat verbose tool display (tool call lines above streamed text). */
+const verboseChats = new Set<number>();
+
+/**
+ * Live preview via editMessageText: placeholder first, then throttled updates.
+ */
+function makeStreamCallback(
+  token: string,
+  chatId: number,
+  threadId: number | undefined,
+  options: { intervalMs?: number; verbose?: boolean } = {},
+): {
+  onChunk: (text: string) => void;
+  onToolEvent: (line: string) => void;
+  resetStream: () => void;
+  waitForStreamMsg: () => Promise<{ msgId: number | null; hadToolLines: boolean }>;
+} {
+  const { intervalMs = 500, verbose = false } = options;
+  let textAcc = "";
+  const toolLines: string[] = [];
+  let lastSentAt = 0;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let streamMsgId: number | null = null;
+  let initPromise: Promise<void> | null = null;
+  let finalized = false;
+
+  const getDisplay = () => {
+    const MAX_TOOL_LINES = 8;
+    const MAX_TEXT_LINES = 15;
+    let toolPart: string;
+    if (toolLines.length > MAX_TOOL_LINES) {
+      const shown = toolLines.slice(-MAX_TOOL_LINES);
+      toolPart = `[...${toolLines.length - MAX_TOOL_LINES} earlier]\n` + shown.join("\n");
+    } else {
+      toolPart = toolLines.join("\n");
+    }
+    let textPart = textAcc;
+    const textLines = textPart.split("\n");
+    if (textLines.length > MAX_TEXT_LINES) {
+      textPart = `[...]\n` + textLines.slice(-MAX_TEXT_LINES).join("\n");
+    }
+    return toolPart + (textPart ? (toolPart ? "\n\n" : "") + textPart : "");
+  };
+
+  const editStream = () => {
+    if (!streamMsgId || finalized) return;
+    let display: string;
+    if (verbose) {
+      display = getDisplay();
+    } else {
+      const lines = textAcc.split("\n");
+      display = lines.length > 30 ? `[...]\n${lines.slice(-30).join("\n")}` : textAcc;
+    }
+    if (!display) return;
+    callApi(token, "editMessageText", {
+      chat_id: chatId,
+      message_id: streamMsgId,
+      text: display.slice(0, 4096),
+    }).catch(() => {});
+  };
+
+  const flush = async () => {
+    const display = verbose ? getDisplay() : textAcc;
+    if (!display) return;
+    lastSentAt = Date.now();
+
+    if (!streamMsgId && !initPromise) {
+      initPromise = (async () => {
+        try {
+          const res = await callApi<{ ok: boolean; result: { message_id: number } }>(token, "sendMessage", {
+            chat_id: chatId,
+            text: "⏳",
+            ...(threadId ? { message_thread_id: threadId } : {}),
+          });
+          if (res.ok) {
+            streamMsgId = res.result.message_id;
+            editStream();
+          }
+        } catch {}
+      })();
+      await initPromise;
+    } else {
+      if (initPromise) await initPromise;
+      editStream();
+    }
+  };
+
+  const onChunk = (text: string) => {
+    textAcc += text;
+    const now = Date.now();
+    if (now - lastSentAt >= intervalMs) {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      flush();
+    } else if (!timer) {
+      timer = setTimeout(() => {
+        timer = null;
+        flush();
+      }, intervalMs - (now - lastSentAt));
+    }
+  };
+
+  const onToolEvent = (line: string) => {
+    if (!verbose) return;
+    toolLines.push(line);
+    const now = Date.now();
+    if (now - lastSentAt >= intervalMs) {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      flush();
+    } else if (!timer) {
+      timer = setTimeout(() => {
+        timer = null;
+        flush();
+      }, intervalMs - (now - lastSentAt));
+    }
+  };
+
+  const waitForStreamMsg = async (): Promise<{ msgId: number | null; hadToolLines: boolean }> => {
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    if (initPromise) await initPromise;
+    finalized = true;
+    return { msgId: streamMsgId, hadToolLines: toolLines.length > 0 };
+  };
+
+  const resetStream = () => {
+    textAcc = "";
+    toolLines.length = 0;
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    lastSentAt = 0;
+  };
+
+  return { onChunk, onToolEvent, resetStream, waitForStreamMsg };
+}
+
 function extractReactionDirective(text: string): { cleanedText: string; reactionEmoji: string | null } {
   let reactionEmoji: string | null = null;
   const cleanedText = text
@@ -744,6 +889,22 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     return;
   }
 
+  if (command === "/verbose") {
+    if (verboseChats.has(chatId)) {
+      verboseChats.delete(chatId);
+      await sendMessage(config.token, chatId, "Verbose tool display: **off**", threadId);
+    } else {
+      verboseChats.add(chatId);
+      await sendMessage(
+        config.token,
+        chatId,
+        "Verbose tool display: **on** — tool calls appear above the streamed reply.",
+        threadId,
+      );
+    }
+    return;
+  }
+
   if (command === "/compact") {
     await sendMessage(config.token, chatId, "⏳ Compacting session...", threadId);
     const result = await compactCurrentSession();
@@ -925,7 +1086,7 @@ Usage: /setfallback openrouter/model-id`, threadId);
     return;
   }
 
-    if (command && command !== "/start" && command !== "/reset" && command !== "/interrupt" && command !== "/compact" && command !== "/status" && command !== "/context" && command !== "/setfallback") {
+    if (command && command !== "/start" && command !== "/reset" && command !== "/interrupt" && command !== "/verbose" && command !== "/compact" && command !== "/status" && command !== "/context" && command !== "/setfallback") {
       try {
         skillContext = await resolveSkillPrompt(command);
         if (skillContext) {
@@ -984,7 +1145,18 @@ Usage: /setfallback openrouter/model-id`, threadId);
       );
     }
     const prefixedPrompt = promptParts.join("\n");
-    const result = await runUserMessage("telegram", prefixedPrompt);
+    const verbose = verboseChats.has(chatId);
+    const stream = makeStreamCallback(config.token, chatId, threadId, { verbose });
+    const sessionKey = threadId !== undefined ? String(threadId) : undefined;
+    const result = await runUserMessage(
+      "telegram",
+      prefixedPrompt,
+      sessionKey,
+      stream.onChunk,
+      stream.onToolEvent,
+      stream.resetStream,
+    );
+    const { msgId: streamMsgId, hadToolLines } = await stream.waitForStreamMsg();
 
     if (result.exitCode !== 0) {
       if (result.exitCode === 143) {
@@ -994,7 +1166,16 @@ Usage: /setfallback openrouter/model-id`, threadId);
       }
       const detail = humanReadableFromClaudeCliOutput(result.stdout || "", result.stderr || "");
       const clipped = detail.length > 3500 ? `${detail.slice(0, 3500)}…` : detail;
-      await sendMessage(config.token, chatId, `Error (exit ${result.exitCode}): ${clipped}`, threadId);
+      const errorMsg = `Error (exit ${result.exitCode}): ${clipped}`;
+      if (streamMsgId) {
+        await callApi(config.token, "editMessageText", {
+          chat_id: chatId,
+          message_id: streamMsgId,
+          text: errorMsg.slice(0, 4096),
+        }).catch(() => sendMessage(config.token, chatId, errorMsg, threadId));
+      } else {
+        await sendMessage(config.token, chatId, errorMsg, threadId);
+      }
     } else {
       if (result.freshSessionStart) {
         await sendMessage(
@@ -1012,13 +1193,28 @@ Usage: /setfallback openrouter/model-id`, threadId);
           console.error(`[Telegram] Failed to send reaction for ${label}: ${err instanceof Error ? err.message : err}`);
         });
       }
-      if (cleanedText) {
-        await sendMessage(
-          config.token,
-          chatId,
-          formatModelHeaderMarkdown(result.modelTag) + cleanedText,
-          threadId,
+      const header = formatModelHeaderMarkdown(result.modelTag);
+      const finalBody = cleanedText || "(empty response)";
+      if (streamMsgId) {
+        const html = markdownToTelegramHtml(normalizeTelegramText(header + finalBody));
+        await callApi(config.token, "editMessageText", {
+          chat_id: chatId,
+          message_id: streamMsgId,
+          text: html.slice(0, 4096),
+          parse_mode: "HTML",
+        }).catch(() =>
+          callApi(config.token, "editMessageText", {
+            chat_id: chatId,
+            message_id: streamMsgId,
+            text: (header + finalBody).slice(0, 4096),
+          }).catch(() => {
+            if (verbose && hadToolLines) {
+              return sendMessage(config.token, chatId, header + finalBody, threadId);
+            }
+          }),
         );
+      } else if (cleanedText) {
+        await sendMessage(config.token, chatId, header + cleanedText, threadId);
       }
       for (const fp of filePaths) {
         try {
@@ -1060,7 +1256,7 @@ Usage: /setfallback openrouter/model-id`, threadId);
         }
       }
 
-      if (!cleanedText && filePaths.length === 0 && imagePrompts.length === 0) {
+      if (!cleanedText && filePaths.length === 0 && imagePrompts.length === 0 && !streamMsgId) {
         await sendMessage(
           config.token,
           chatId,
@@ -1126,6 +1322,7 @@ async function registerBotCommands(token: string): Promise<void> {
       { command: "start", description: "Show welcome message" },
       { command: "reset", description: "Reset session and start fresh" },
       { command: "interrupt", description: "Interrupt the currently running Claude task" },
+      { command: "verbose", description: "Toggle live tool-call display in streamed replies" },
       { command: "compact", description: "Compact session to reduce context size" },
       { command: "status", description: "Show current session status" },
       { command: "usefallback", description: "Force all messages through fallback model" },
@@ -1154,7 +1351,9 @@ async function registerBotCommands(token: string): Promise<void> {
     } catch (regErr) {
       // Skill-generated commands may violate Telegram constraints; retry with built-in commands only
       console.warn(`[Telegram] Full command registration failed, retrying with built-in commands only: ${regErr instanceof Error ? regErr.message : regErr}`);
-      const builtinOnly = commands.filter((c) => ["start", "reset", "interrupt", "compact", "status", "context"].includes(c.command));
+      const builtinOnly = commands.filter((c) =>
+        ["start", "reset", "interrupt", "verbose", "compact", "status", "context"].includes(c.command),
+      );
       await callApi(token, "setMyCommands", { commands: builtinOnly });
       console.log(`  Commands registered (built-in only): ${builtinOnly.length}`);
     }
