@@ -6,7 +6,16 @@ import {
   compactCurrentSession,
   interruptActiveRuns,
 } from "../runner";
-import { getSettings, loadSettings, resolveImageGenApiKey, isForceFallbackMode, setForceFallbackMode, updateFallbackModel } from "../config";
+import {
+  getSettings,
+  loadSettings,
+  resolveImageGenApiKey,
+  isForceFallbackMode,
+  setForceFallbackMode,
+  updateFallbackModel,
+  updateCursorFallbackModel,
+  setCursorFallbackEnabled,
+} from "../config";
 import { generateImageOpenRouter } from "../openrouterImage";
 import { resetSession, peekSession } from "../sessions";
 import { readFile } from "node:fs/promises";
@@ -1086,7 +1095,46 @@ Usage: /setfallback openrouter/model-id`, threadId);
     return;
   }
 
-    if (command && command !== "/start" && command !== "/reset" && command !== "/interrupt" && command !== "/verbose" && command !== "/compact" && command !== "/status" && command !== "/context" && command !== "/setfallback") {
+  if (command === "/cursorfallback") {
+    const arg = text.trim().slice("/cursorfallback".length).trim().toLowerCase();
+    const s = getSettings();
+    if (arg !== "on" && arg !== "off") {
+      await sendMessage(
+        config.token,
+        chatId,
+        `Cursor fallback: ${s.cursorFallback?.enabled ? "on" : "off"} (model: \`${s.cursorFallback?.model || "auto"}\`)
+
+Tried before /setfallback's model when Claude hits its rate limit.
+Usage: /cursorfallback on|off — /setcursormodel <model|auto>`,
+        threadId,
+      );
+      return;
+    }
+    await setCursorFallbackEnabled(arg === "on");
+    await sendMessage(config.token, chatId, `Cursor fallback: ${arg}`, threadId);
+    return;
+  }
+
+  if (command === "/setcursormodel") {
+    const modelId = text.trim().slice("/setcursormodel".length).trim();
+    if (!modelId) {
+      const s = getSettings();
+      await sendMessage(
+        config.token,
+        chatId,
+        `Current Cursor fallback model: \`${s.cursorFallback?.model || "auto"}\`
+
+Usage: /setcursormodel auto|gpt-5|sonnet-4-thinking|... (any \`cursor-agent --model\` value; "auto" lets Cursor pick)`,
+        threadId,
+      );
+      return;
+    }
+    await updateCursorFallbackModel(modelId);
+    await sendMessage(config.token, chatId, `Cursor fallback model updated: \`${modelId}\``, threadId);
+    return;
+  }
+
+    if (command && command !== "/start" && command !== "/reset" && command !== "/interrupt" && command !== "/verbose" && command !== "/compact" && command !== "/status" && command !== "/context" && command !== "/setfallback" && command !== "/cursorfallback" && command !== "/setcursormodel") {
       try {
         skillContext = await resolveSkillPrompt(command);
         if (skillContext) {
@@ -1328,6 +1376,8 @@ async function registerBotCommands(token: string): Promise<void> {
       { command: "usefallback", description: "Force all messages through fallback model" },
       { command: "useprimary", description: "Switch back to primary model" },
       { command: "setfallback", description: "Set the OpenRouter fallback model (e.g. openrouter/google/gemini-2.5-pro)" },
+      { command: "cursorfallback", description: "Toggle the Cursor CLI fallback (tried before the OpenRouter fallback)" },
+      { command: "setcursormodel", description: "Set the Cursor fallback model, or 'auto'" },
       { command: "context", description: "Show context window usage" },
     ];
     for (const skill of skills) {

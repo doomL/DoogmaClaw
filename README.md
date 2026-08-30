@@ -30,11 +30,12 @@ DoogmaClaw is a custom version of ClaudeClaw designed for maximum automation and
 Compared to the original ClaudeClaw, this fork includes:
 
 - **OpenRouter Integration:** Native support for OpenRouter, allowing the use of any LLM as primary or fallback (e.g., Nemotron, Llama 3, GPT-4o) without changing the core setup.
+- **Cursor CLI Fallback Tier:** An optional fallback tier tried *before* the OpenRouter/API fallback — when the primary Claude session hits its rate limit, ClaudeClaw first hands the message to `cursor-agent -p` (model `auto` or a specific one you pick), and only falls through to `fallback.model` if Cursor isn't usable. Toggle with `/cursorfallback on|off`, pick a model with `/setcursormodel <model|auto>`.
 - **Robust Fallback System:** Fixed critical bugs during model switching (e.g., "Error 1" related to thinking blocks) to ensure seamless transitions between primary and fallback models.
 - **Advanced Runner Logic:** Overhauled execution flow for better reliability, handling of complex agentic behaviors, and session transcript management.
 - **Rich Telegram Interface:** 
   - **Native Reactions:** Support for `[react:emoji]` tags in responses.
-  - **Direct Control:** New Telegram commands to set fallbacks on-the-fly, stop running tasks, and manage session state directly from the chat.
+  - **Direct Control:** New Telegram commands to set fallbacks on-the-fly (including the Cursor fallback tier), stop running tasks, and manage session state directly from the chat.
 - **Template Ecosystem:** Includes a `/template` directory with production-ready configurations, custom skills, and automation scripts (e.g., Daily Email Digest via IMAP).
 
 ## 🛠 Getting Started

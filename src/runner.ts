@@ -11,6 +11,7 @@ import {
 import { getSettings, isForceFallbackMode, type ModelConfig, type SecurityConfig } from "./config";
 import { buildClockPromptPrefix } from "./timezone";
 import { selectModel } from "./model-router";
+import { invokeCursorAgentAsClaudeResult, type CursorOutputFormat } from "./cursorAgent";
 import {
   extractLastVisibleAssistantTextFromSessionJsonl,
   isPlaceholderAssistantOutput,
@@ -107,7 +108,11 @@ function buildModelTag(
   effective: ModelConfig,
   agentic: boolean,
   taskType: string,
+  cursorModel?: string,
 ): string {
+  if (cursorModel !== undefined) {
+    return `cursor-fallback · ${cursorModel.trim() || "auto"}`;
+  }
   const slot = usedFallback ? "fallback" : "primary";
   const name = effective.model.trim() || "(default API model)";
   return agentic ? `${slot} · ${name} · ${taskType}` : `${slot} · ${name}`;
@@ -556,6 +561,58 @@ async function invokeClaude(
   return runClaudeOnce(baseArgs, model, api, baseEnv, timeoutMs);
 }
 
+function outputFormatFromArgs(args: string[]): CursorOutputFormat {
+  const idx = args.indexOf("--output-format");
+  const v = idx >= 0 ? args[idx + 1] : undefined;
+  return v === "json" || v === "stream-json" ? v : "text";
+}
+
+type FallbackState = { usedCursor: boolean; cursorModel?: string };
+
+/**
+ * Every "retry with fallback" call site in execClaude routes through here.
+ * Tries the Cursor CLI agent first (if `cursorFallback.enabled`); on any
+ * failure (missing API key, missing binary, timeout, empty/non-zero reply)
+ * it transparently falls through to the existing API fallback (`fallback`),
+ * exactly as if Cursor fallback weren't configured at all.
+ */
+async function invokeFallbackTier(
+  args: string[],
+  fallbackConfig: ModelConfig,
+  baseEnv: Record<string, string>,
+  timeoutMs: number,
+  streamCb: { onChunk?: (text: string) => void; onToolEvent?: (line: string) => void } | undefined,
+  prompt: string,
+  state: FallbackState,
+): Promise<ClaudeInvokeResult> {
+  const cursorCfg = getSettings().cursorFallback;
+  if (cursorCfg?.enabled) {
+    try {
+      const cursorResult = await invokeCursorAgentAsClaudeResult(
+        prompt,
+        cursorCfg.model,
+        cursorCfg.api,
+        outputFormatFromArgs(args),
+        timeoutMs,
+        streamCb?.onChunk,
+      );
+      if (cursorResult) {
+        state.usedCursor = true;
+        state.cursorModel = cursorCfg.model;
+        console.log(
+          `[${new Date().toLocaleTimeString()}] Cursor fallback answered (model: ${cursorCfg.model || "auto"}).`,
+        );
+        return cursorResult;
+      }
+    } catch (err) {
+      console.warn(
+        `[${new Date().toLocaleTimeString()}] Cursor fallback errored, trying API fallback: ${err instanceof Error ? err.message : err}`,
+      );
+    }
+  }
+  return invokeClaude(args, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs, streamCb);
+}
+
 const PROJECT_DIR = process.cwd();
 
 const DIR_SCOPE_PROMPT = [
@@ -803,6 +860,7 @@ async function execClaude(
   let effectiveResumeId = resumeSessionId;
   let usedFallback = false;
   let usedFreshSessionStart = false;
+  const fallbackState: FallbackState = { usedCursor: false };
 
   if (effectiveResumeId && !isNew && !(isForceFallbackMode() && hasModelConfig(fallbackConfig))) {
     if (await sessionHasNonAnthropicAssistantIds(effectiveResumeId)) {
@@ -848,18 +906,18 @@ async function execClaude(
         );
       }
       args = buildClaudeInvokeArgs(prompt, securityArgs, appendSystemPrompt, resumeSessionId, useStreamJson);
-      exec = await invokeClaude(args, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs, streamCb);
+      exec = await invokeFallbackTier(args, fallbackConfig, baseEnv, timeoutMs, streamCb, prompt, fallbackState);
       if (exec.exitCode !== 0) {
         console.warn(
           `[${new Date().toLocaleTimeString()}] Fallback --resume still failed; starting a new Claude session (this message only).`
         );
         args = buildClaudeInvokeArgs(prompt, securityArgs, appendSystemPrompt, null, useStreamJson);
-        exec = await invokeClaude(args, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs, streamCb);
+        exec = await invokeFallbackTier(args, fallbackConfig, baseEnv, timeoutMs, streamCb, prompt, fallbackState);
         usedFreshSessionStart = true;
       }
     } else {
       args = buildClaudeInvokeArgs(prompt, securityArgs, appendSystemPrompt, resumeSessionId, useStreamJson);
-      exec = await invokeClaude(args, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs, streamCb);
+      exec = await invokeFallbackTier(args, fallbackConfig, baseEnv, timeoutMs, streamCb, prompt, fallbackState);
     }
   } else if (
     exec.exitCode !== 0 &&
@@ -928,10 +986,10 @@ async function execClaude(
         );
       }
       usedFallback = true;
-      exec = await invokeClaude(args, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs, streamCb);
+      exec = await invokeFallbackTier(args, fallbackConfig, baseEnv, timeoutMs, streamCb, prompt, fallbackState);
       if (exec.exitCode !== 0) {
         args = buildClaudeInvokeArgs(prompt, securityArgs, appendSystemPrompt, null, useStreamJson);
-        exec = await invokeClaude(args, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs, streamCb);
+        exec = await invokeFallbackTier(args, fallbackConfig, baseEnv, timeoutMs, streamCb, prompt, fallbackState);
         usedFreshSessionStart = true;
       }
     }
@@ -970,18 +1028,18 @@ async function execClaude(
         );
       }
       args = buildClaudeInvokeArgs(prompt, securityArgs, appendSystemPrompt, rid, useStreamJson);
-      exec = await invokeClaude(args, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs, streamCb);
+      exec = await invokeFallbackTier(args, fallbackConfig, baseEnv, timeoutMs, streamCb, prompt, fallbackState);
       if (exec.exitCode !== 0) {
         console.warn(
           `[${new Date().toLocaleTimeString()}] Fallback --resume still failed; starting a new Claude session (this message only).`,
         );
         args = buildClaudeInvokeArgs(prompt, securityArgs, appendSystemPrompt, null, useStreamJson);
-        exec = await invokeClaude(args, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs, streamCb);
+        exec = await invokeFallbackTier(args, fallbackConfig, baseEnv, timeoutMs, streamCb, prompt, fallbackState);
         usedFreshSessionStart = true;
       }
     } else {
       args = buildClaudeInvokeArgs(prompt, securityArgs, appendSystemPrompt, null, useStreamJson);
-      exec = await invokeClaude(args, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs, streamCb);
+      exec = await invokeFallbackTier(args, fallbackConfig, baseEnv, timeoutMs, streamCb, prompt, fallbackState);
       if (exec.exitCode !== 0) usedFreshSessionStart = true;
     }
   }
@@ -1048,7 +1106,13 @@ async function execClaude(
   }
 
   const effectiveCfg: ModelConfig = usedFallback ? fallbackConfig : primaryConfig;
-  const modelTag = buildModelTag(usedFallback, effectiveCfg, agentic.enabled, taskType);
+  const modelTag = buildModelTag(
+    usedFallback,
+    effectiveCfg,
+    agentic.enabled,
+    taskType,
+    fallbackState.usedCursor ? fallbackState.cursorModel ?? "auto" : undefined,
+  );
 
   const result: RunResult = {
     stdout,
@@ -1119,7 +1183,7 @@ async function execClaude(
       );
       usedFallback = true;
       const fbArgs = buildClaudeInvokeArgs(prompt, securityArgs, appendSystemPrompt, null, useStreamJson);
-      exec = await invokeClaude(fbArgs, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs, streamCb);
+      exec = await invokeFallbackTier(fbArgs, fallbackConfig, baseEnv, timeoutMs, streamCb, prompt, fallbackState);
       usedFreshSessionStart = true;
     }
   }

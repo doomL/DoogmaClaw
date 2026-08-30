@@ -15,6 +15,11 @@ const DEFAULT_SETTINGS: Settings = {
     model: "",
     api: "",
   },
+  cursorFallback: {
+    enabled: false,
+    model: "auto",
+    api: "",
+  },
   sessionTimeoutMs: 15 * 60 * 1000,
   agentic: {
     enabled: false,
@@ -110,6 +115,8 @@ export interface Settings {
   model: string;
   api: string;
   fallback: ModelConfig;
+  /** Tried before `fallback` when the primary Claude session hits its rate limit. */
+  cursorFallback: CursorFallbackConfig;
   agentic: AgenticConfig;
   /** Max wall time for one `claude -p` invocation (ms). Default 15m; cap 2h. */
   sessionTimeoutMs: number;
@@ -139,6 +146,15 @@ export interface AgenticConfig {
 
 export interface ModelConfig {
   model: string;
+  api: string;
+}
+
+/** First fallback tier: the Cursor CLI agent (`cursor-agent -p`), tried before `fallback`. */
+export interface CursorFallbackConfig {
+  enabled: boolean;
+  /** Cursor model id (e.g. "gpt-5", "sonnet-4-thinking"), or "auto" to let cursor-agent pick. */
+  model: string;
+  /** Cursor API key; falls back to the CURSOR_API_KEY env var when empty. */
   api: string;
 }
 
@@ -265,6 +281,14 @@ function parseSettings(raw: Record<string, any>, discordUserIdsOverride?: string
     fallback: {
       model: typeof raw.fallback?.model === "string" ? raw.fallback.model.trim() : "",
       api: typeof raw.fallback?.api === "string" ? raw.fallback.api.trim() : "",
+    },
+    cursorFallback: {
+      enabled: Boolean(raw.cursorFallback?.enabled),
+      model:
+        typeof raw.cursorFallback?.model === "string" && raw.cursorFallback.model.trim()
+          ? raw.cursorFallback.model.trim()
+          : "auto",
+      api: typeof raw.cursorFallback?.api === "string" ? raw.cursorFallback.api.trim() : "",
     },
     sessionTimeoutMs: parseSessionTimeoutMs(raw.sessionTimeoutMs),
     agentic: parseAgenticConfig(raw.agentic),
@@ -411,6 +435,28 @@ export async function updateFallbackModel(model: string): Promise<void> {
   const raw = JSON.parse(rawText);
   if (!raw.fallback) raw.fallback = {};
   raw.fallback.model = model.trim();
+  await Bun.write(SETTINGS_FILE, JSON.stringify(raw, null, 2) + "\n");
+  const discordIds = extractDiscordUserIds(rawText);
+  cached = parseSettings(raw, discordIds);
+}
+
+/** Persist the Cursor fallback model (or "auto") to settings.json and reload the cache. */
+export async function updateCursorFallbackModel(model: string): Promise<void> {
+  const rawText = await Bun.file(SETTINGS_FILE).text();
+  const raw = JSON.parse(rawText);
+  if (!raw.cursorFallback) raw.cursorFallback = {};
+  raw.cursorFallback.model = model.trim() || "auto";
+  await Bun.write(SETTINGS_FILE, JSON.stringify(raw, null, 2) + "\n");
+  const discordIds = extractDiscordUserIds(rawText);
+  cached = parseSettings(raw, discordIds);
+}
+
+/** Enable/disable the Cursor fallback tier in settings.json and reload the cache. */
+export async function setCursorFallbackEnabled(enabled: boolean): Promise<void> {
+  const rawText = await Bun.file(SETTINGS_FILE).text();
+  const raw = JSON.parse(rawText);
+  if (!raw.cursorFallback) raw.cursorFallback = {};
+  raw.cursorFallback.enabled = enabled;
   await Bun.write(SETTINGS_FILE, JSON.stringify(raw, null, 2) + "\n");
   const discordIds = extractDiscordUserIds(rawText);
   cached = parseSettings(raw, discordIds);

@@ -78,6 +78,7 @@ Start the heartbeat daemon for this project. Follow these steps exactly:
      - If "No": Set `agentic.enabled` to `false`.
    - Ask whether to set a fallback model. Recommend `glm` first so fallback uses a different provider path than the primary Claude model. If yes, set `fallback.model` and optionally `fallback.api`.
    - Ask whether to enable GLM fallback (kicks in automatically when your Claude token limit is hit). The fallback model is always `glm` — no other model is supported. Use AskUserQuestion: "Enable GLM fallback? Automatically switches to GLM when your Claude limit is hit." (header: "Fallback", options: "Yes — enable GLM fallback", "Skip"). If yes, ask in normal free-form text for the GLM API token (optional, user can skip). Set `fallback.model` to `"glm"` and `fallback.api` to the token if provided.
+   - Ask whether to enable the Cursor CLI fallback tier, tried *before* the model set above (requires `cursor-agent` installed and a Cursor API key). Use AskUserQuestion: "Also try the Cursor CLI agent before falling back to an API model?" (header: "Cursor fallback", options: "Yes — enable Cursor fallback", "Skip"). If yes, ask in normal free-form text which Cursor model to use (default `"auto"`) and, optionally, a Cursor API key (skip to rely on the `CURSOR_API_KEY` env var instead). Set `cursorFallback.enabled` to `true`, `cursorFallback.model` to their answer (or `"auto"`), and `cursorFallback.api` to the key if provided.
 
    - **If yes to heartbeat**: Use AskUserQuestion again with one question:
      - "How often should it run in minutes?" (header: "Interval", options: "5", "15", "30 (Recommended)", "60")
@@ -176,6 +177,11 @@ Defaults: `WEB_HOST=127.0.0.1`, `WEB_PORT=4632` unless changed via settings or `
     "model": "glm",
     "api": ""
   },
+  "cursorFallback": {
+    "enabled": false,
+    "model": "auto",
+    "api": ""
+  },
   "agentic": {
     "enabled": true,
     "defaultMode": "implementation",
@@ -221,6 +227,9 @@ Defaults: `WEB_HOST=127.0.0.1`, `WEB_PORT=4632` unless changed via settings or `
 - `api` — API token used when `model` is `glm` (passed as `ANTHROPIC_AUTH_TOKEN` for that provider path).
 - `fallback.model` — backup model used automatically if the primary run returns a rate-limit message. Prefer `glm` for provider diversity.
 - `fallback.api` — optional API token to use with `fallback.model`.
+- `cursorFallback.enabled` — when true, `cursor-agent -p` is tried *before* `fallback.model` on rate limit; falls through to `fallback.model` if Cursor isn't usable (missing binary/key, error, timeout).
+- `cursorFallback.model` — Cursor model id (e.g. `gpt-5`, `sonnet-4-thinking`), or `"auto"` to let `cursor-agent` pick its own default.
+- `cursorFallback.api` — optional Cursor API key; falls back to the `CURSOR_API_KEY` env var when empty.
 - `agentic.enabled` — when true, automatically routes tasks to appropriate models based on task type
 - `agentic.defaultMode` — which mode to use when no keywords match (default: `"implementation"`)
 - `agentic.modes` — array of routing modes, each with: `name` (string), `model` (string), `keywords` (string[]), optional `phrases` (string[], checked before keywords with higher priority). Old `planningModel`/`implementationModel` format is auto-converted.

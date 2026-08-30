@@ -18,6 +18,7 @@ Parse `$ARGUMENTS` to identify what the user wants. If no arguments are given, s
    - API token: (first 5 chars + "..." or "not configured"; used when `model` is `glm`)
    - Fallback model: (e.g. `glm`, `sonnet`, or "not configured")
    - Fallback API token: (first 5 chars + "..." or "not configured")
+   - Cursor fallback: on/off, model (e.g. `auto`), API key (first 5 chars + "..." or "not configured — uses CURSOR_API_KEY env var if set")
    - Timezone: (e.g. `America/New_York` or "UTC")
 
    **Heartbeat**
@@ -154,6 +155,40 @@ Set or clear the API token for the fallback model.
 4. Set `fallback.api` to the new value.
 5. Write and confirm.
 
+### `cursor fallback on` / `cursor fallback off`
+
+Enable or disable the Cursor CLI agent fallback tier. When enabled, it's tried
+*before* `fallback.model` whenever the primary Claude session hits its rate
+limit — if `cursor-agent -p` answers successfully, `fallback.model` (e.g.
+OpenRouter) never gets called; if Cursor fails or isn't configured, it falls
+through to `fallback.model` exactly as before.
+
+1. Read `.claude/claudeclaw/settings.json`.
+2. Set `cursorFallback.enabled` to `true`/`false`.
+3. Write and confirm. Mention that `cursor-agent` must be installed and either
+   `cursorFallback.api` or the `CURSOR_API_KEY` env var must hold a valid
+   Cursor API key, or the tier silently falls through to `fallback.model`.
+
+### `cursor fallback model <name>` / `cursor fallback model`
+
+Set which Cursor model the fallback uses.
+
+1. If a model name is in `$ARGUMENTS`, use it directly.
+2. Otherwise, use **AskUserQuestion**: "Which Cursor model should the fallback use?" (header: "Cursor model", options: "auto (Recommended)", "gpt-5", "sonnet-4-thinking")
+3. Read `.claude/claudeclaw/settings.json`.
+4. Set `cursorFallback.model` to the chosen value (`"auto"` lets `cursor-agent` pick its own default — no `--model` flag is passed).
+5. Write and confirm.
+
+### `cursor fallback api <key>` / `cursor fallback api`
+
+Set or clear the Cursor API key used for the fallback.
+
+1. If a key is in `$ARGUMENTS`, use it directly.
+2. Otherwise, use **AskUserQuestion**: "What API key should ClaudeClaw use for the Cursor fallback?" (header: "Cursor API key", options: let user type via Other)
+3. Read `.claude/claudeclaw/settings.json`.
+4. Set `cursorFallback.api` to the new value (leave empty to rely on the `CURSOR_API_KEY` env var instead).
+5. Write and confirm.
+
 ### `timezone <tz>` / `timezone`
 
 Set the IANA timezone (e.g. `America/New_York`, `Europe/London`, `UTC`).
@@ -214,6 +249,11 @@ Reset all settings to defaults.
        "model": "",
        "api": ""
      },
+     "cursorFallback": {
+       "enabled": false,
+       "model": "auto",
+       "api": ""
+     },
      "timezone": "UTC",
      "timezoneOffsetMinutes": 0,
      "heartbeat": {
@@ -255,6 +295,11 @@ Location: `.claude/claudeclaw/settings.json`
     "model": "glm",
     "api": ""
   },
+  "cursorFallback": {
+    "enabled": true,
+    "model": "auto",
+    "api": ""
+  },
   "timezone": "America/New_York",
   "timezoneOffsetMinutes": -300,
   "heartbeat": {
@@ -289,6 +334,9 @@ Location: `.claude/claudeclaw/settings.json`
 | `api`                      | string     | API token used when model is `glm` (mapped to `ANTHROPIC_AUTH_TOKEN`) |
 | `fallback.model`           | string     | Backup model used automatically if primary run returns rate-limit text (recommend `glm` for provider diversity) |
 | `fallback.api`             | string     | API token used with `fallback.model` (optional) |
+| `cursorFallback.enabled`   | boolean    | Tried *before* `fallback.model` on rate limit — routes the message to `cursor-agent -p` instead |
+| `cursorFallback.model`     | string     | Cursor model id (e.g. `gpt-5`, `sonnet-4-thinking`), or `auto` to let `cursor-agent` pick |
+| `cursorFallback.api`       | string     | Cursor API key (optional — falls back to the `CURSOR_API_KEY` env var) |
 | `timezone`                 | string     | IANA timezone name (e.g. `America/New_York`)   |
 | `timezoneOffsetMinutes`    | number     | UTC offset in minutes (auto-resolved from timezone) |
 | `heartbeat.enabled`        | boolean    | Whether the recurring heartbeat runs           |
