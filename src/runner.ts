@@ -8,7 +8,7 @@ import {
   incrementThreadTurn,
   markThreadCompactWarned,
 } from "./sessionManager";
-import { getSettings, isForceFallbackMode, type ModelConfig, type SecurityConfig } from "./config";
+import { getSettings, isForceFallbackMode, isForceCursorMode, type ModelConfig, type SecurityConfig } from "./config";
 import { buildClockPromptPrefix } from "./timezone";
 import { selectModel } from "./model-router";
 import { invokeCursorAgentAsClaudeResult, type CursorOutputFormat } from "./cursorAgent";
@@ -890,7 +890,30 @@ async function execClaude(
   const { CLAUDECODE: _, ...cleanEnv } = process.env;
   const baseEnv = { ...cleanEnv } as Record<string, string>;
 
-  let exec = await invokeClaude(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs, streamCb);
+  let exec: ClaudeInvokeResult | undefined;
+  if (isForceCursorMode()) {
+    const cursorCfg = settings.cursorFallback;
+    const cursorResult = await invokeCursorAgentAsClaudeResult(
+      prompt,
+      cursorCfg.model,
+      cursorCfg.api,
+      outputFormatFromArgs(args),
+      timeoutMs,
+      streamCb?.onChunk,
+    );
+    if (cursorResult) {
+      fallbackState.usedCursor = true;
+      fallbackState.cursorModel = cursorCfg.model;
+      exec = cursorResult;
+    } else {
+      console.warn(
+        `[${new Date().toLocaleTimeString()}] /usecursor: Cursor unusable, running primary instead.`,
+      );
+    }
+  }
+  if (!exec) {
+    exec = await invokeClaude(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs, streamCb);
+  }
   const primaryRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
 
   if (primaryRateLimit && hasModelConfig(fallbackConfig) && !sameModelConfig(primaryConfig, fallbackConfig)) {

@@ -466,6 +466,12 @@ export async function setCursorFallbackEnabled(enabled: boolean): Promise<void> 
 let _forceFallbackMode = false;
 export function isForceFallbackMode(): boolean { return _forceFallbackMode; }
 export function setForceFallbackMode(v: boolean): void { _forceFallbackMode = v; }
+
+// --- Force-cursor mode: routes the next primary attempt through cursor-agent
+// (in-memory only, not persisted). Manual test switch for /usecursor. ---
+let _forceCursorMode = false;
+export function isForceCursorMode(): boolean { return _forceCursorMode; }
+export function setForceCursorMode(v: boolean): void { _forceCursorMode = v; }
 export function getSettings(): Settings {
   if (!cached) throw new Error("Settings not loaded. Call loadSettings() first.");
   return cached;

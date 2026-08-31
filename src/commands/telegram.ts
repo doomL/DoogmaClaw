@@ -12,6 +12,8 @@ import {
   resolveImageGenApiKey,
   isForceFallbackMode,
   setForceFallbackMode,
+  isForceCursorMode,
+  setForceCursorMode,
   updateFallbackModel,
   updateCursorFallbackModel,
   setCursorFallbackEnabled,
@@ -1076,8 +1078,30 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
 
   if (command === "/useprimary") {
     setForceFallbackMode(false);
+    setForceCursorMode(false);
     const s = getSettings();
     await sendMessage(config.token, chatId, `Switched back to primary model: \`${s.model || "default"}\``, threadId);
+    return;
+  }
+
+  if (command === "/usecursor") {
+    const s = getSettings();
+    if (!s.cursorFallback?.enabled) {
+      await sendMessage(
+        config.token,
+        chatId,
+        "Cursor fallback isn't enabled. Run /cursorfallback on first.",
+        threadId,
+      );
+      return;
+    }
+    setForceCursorMode(true);
+    await sendMessage(
+      config.token,
+      chatId,
+      `Next message routes through cursor-agent (model: \`${s.cursorFallback.model || "auto"}\`).\nFalls back to the primary model automatically if Cursor isn't usable.\nUse /useprimary to switch back.`,
+      threadId,
+    );
     return;
   }
 
@@ -1134,7 +1158,7 @@ Usage: /setcursormodel auto|gpt-5|sonnet-4-thinking|... (any \`cursor-agent --mo
     return;
   }
 
-    if (command && command !== "/start" && command !== "/reset" && command !== "/interrupt" && command !== "/verbose" && command !== "/compact" && command !== "/status" && command !== "/context" && command !== "/setfallback" && command !== "/cursorfallback" && command !== "/setcursormodel") {
+    if (command && command !== "/start" && command !== "/reset" && command !== "/interrupt" && command !== "/verbose" && command !== "/compact" && command !== "/status" && command !== "/context" && command !== "/setfallback" && command !== "/cursorfallback" && command !== "/setcursormodel" && command !== "/usecursor") {
       try {
         skillContext = await resolveSkillPrompt(command);
         if (skillContext) {
@@ -1374,6 +1398,7 @@ async function registerBotCommands(token: string): Promise<void> {
       { command: "compact", description: "Compact session to reduce context size" },
       { command: "status", description: "Show current session status" },
       { command: "usefallback", description: "Force all messages through fallback model" },
+      { command: "usecursor", description: "Force the next message through the Cursor CLI fallback" },
       { command: "useprimary", description: "Switch back to primary model" },
       { command: "setfallback", description: "Set the OpenRouter fallback model (e.g. openrouter/google/gemini-2.5-pro)" },
       { command: "cursorfallback", description: "Toggle the Cursor CLI fallback (tried before the OpenRouter fallback)" },
